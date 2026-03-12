@@ -1,27 +1,43 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from .config import settings
 from .models import ErrorResponse, ScanRequest, ScanResponse
 from .services import scan_pattern
 
+BASE_URL = "https://pattern-scanner-api.onrender.com"
+
+
+class HealthResponse(BaseModel):
+    status: str
+    service: str
+    version: str
+
+
+class RootResponse(BaseModel):
+    message: str
+    docs: str
+    health: str
+    default_min_age_days: int
+    default_max_age_days: int
+
+
 app = FastAPI(
     title="Crypto Pattern Scanner API",
     version="1.0.0",
     description="Scans recently listed crypto assets and ranks them by similarity to the crown-shelf-right-spike daily-chart silhouette.",
-    servers=[
-        {"url": "https://ТВОЙ-ДОМЕН.onrender.com"}
-    ],
+    servers=[{"url": BASE_URL}],
 )
 
 
-@app.get("/health")
-async def health() -> dict:
-    return {
-        "status": "ok",
-        "service": "crypto-pattern-scanner",
-        "version": "1.0.0",
-    }
+@app.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    return HealthResponse(
+        status="ok",
+        service="crypto-pattern-scanner",
+        version="1.0.0",
+    )
 
 
 @app.post(
@@ -39,12 +55,12 @@ async def scan(req: ScanRequest):
     return await scan_pattern(req)
 
 
-@app.get("/")
-async def root() -> dict:
-    return {
-        "message": "Crypto Pattern Scanner API",
-        "docs": "/docs",
-        "health": "/health",
-        "default_min_age_days": settings.default_min_age_days,
-        "default_max_age_days": settings.default_max_age_days,
-    }
+@app.get("/", response_model=RootResponse)
+async def root() -> RootResponse:
+    return RootResponse(
+        message="Crypto Pattern Scanner API",
+        docs="/docs",
+        health="/health",
+        default_min_age_days=settings.default_min_age_days,
+        default_max_age_days=settings.default_max_age_days,
+    )

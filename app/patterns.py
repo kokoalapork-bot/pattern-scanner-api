@@ -3,8 +3,6 @@ from dataclasses import dataclass
 from typing import Iterable
 
 import numpy as np
-from scipy.interpolate import interp1d
-from scipy.signal import find_peaks, savgol_filter
 
 TARGET_LEN = 128
 
@@ -24,6 +22,20 @@ def clamp01(x: float) -> float:
     return float(max(0.0, min(1.0, x)))
 
 
+def moving_average(y: np.ndarray, window: int = 7) -> np.ndarray:
+    if window <= 1 or len(y) < window:
+        return y.copy()
+
+    if window % 2 == 0:
+        window += 1
+
+    pad = window // 2
+    padded = np.pad(y, (pad, pad), mode="edge")
+    kernel = np.ones(window, dtype=float) / window
+    smoothed = np.convolve(padded, kernel, mode="valid")
+    return smoothed
+
+
 def normalize_series(close: Iterable[float], target_len: int = TARGET_LEN) -> np.ndarray:
     arr = np.asarray(list(close), dtype=float)
     arr = arr[np.isfinite(arr)]
@@ -31,14 +43,11 @@ def normalize_series(close: Iterable[float], target_len: int = TARGET_LEN) -> np
     if len(arr) < 30:
         raise ValueError("Need at least 30 data points to score a pattern")
 
-    x = np.arange(len(arr))
-    f = interp1d(x, arr, kind="linear")
+    x_old = np.arange(len(arr), dtype=float)
     x_new = np.linspace(0, len(arr) - 1, target_len)
-    y = f(x_new)
+    y = np.interp(x_new, x_old, arr)
 
-    win = 11 if target_len >= 11 else max(5, target_len // 2 * 2 + 1)
-    if win >= 5 and win < len(y):
-        y = savgol_filter(y, win, 3 if win >= 7 else 2)
+    y = moving_average(y, window=7)
 
     ymin, ymax = float(np.min(y)), float(np.max(y))
     if math.isclose(ymax, ymin):
@@ -47,9 +56,39 @@ def normalize_series(close: Iterable[float], target_len: int = TARGET_LEN) -> np
     return (y - ymin) / (ymax - ymin)
 
 
+def find_local_peaks(y: np.ndarray, min_prominence: float = 0.04, min_distance: int = 4) -> np.ndarray:
+    peaks: list[int] = []
+    last_peak = -10_000
+
+    for i in range(1, len(y) - 1):
+        if not (y[i] > y[i - 1] and y[i] > y[i + 1]):
+            continue
+
+        left_start = max(0, i - min_distance)
+        right_end = min(len(y), i + min_distance + 1)
+
+        left_min = float(np.min(y[left_start:i + 1]))
+        right_min = float(np.min(y[i:right_end]))
+        prominence = y[i] - max(left_min, right_min)
+
+        if prominence < min_prominence:
+            continue
+
+        if i - last_peak < min_distance:
+            if peaks and y[i] > y[peaks[-1]]:
+                peaks[-1] = i
+                last_peak = i
+            continue
+
+        peaks.append(i)
+        last_peak = i
+
+    return np.asarray(peaks, dtype=int)
+
+
 def crown_score(y: np.ndarray) -> float:
     left = y[:52]
-    peaks, _ = find_peaks(left, prominence=0.04, distance=4)
+    peaks = find_local_peaks(left, min_prominence=0.04, min_distance=4)
 
     if len(peaks) < 3:
         return 0.0
@@ -62,7 +101,7 @@ def crown_score(y: np.ndarray) -> float:
     consistency = clamp01(1.0 - (std_val / (mean_val + 1e-9)))
 
     top_zone_score = float(np.mean(peak_vals > 0.72))
-    uneven_top_bonus = clamp01(float(np.std(np.diff(peaks))) / 12.0)
+    uneven_top_bonus = clamp01(float(np.std(np.diff(peaks))) / 12.0) if len(peaks) > 1 else 0.0
 
     score = 0.38 * count_score + 0.30 * consistency + 0.22 * top_zone_score + 0.10 * uneven_top_bonus
     return clamp01(score)
@@ -90,7 +129,8 @@ def shelf_score(y: np.ndarray) -> float:
     if len(mid) < 20:
         return 0.0
 
-    slope = abs(float(np.polyfit(np.arange(len(mid)), mid, 1)[0]))
+    x = np.arange(len(mid), dtype=float)
+    slope = abs(float(np.polyfit(x, mid, 1)[0]))
     std = float(np.std(mid))
     mid_range = float(np.max(mid) - np.min(mid))
 
@@ -111,7 +151,7 @@ def right_spike_score(y: np.ndarray) -> float:
     peak = float(np.max(right))
     spike = peak - base
 
-    peaks, _ = find_peaks(right, prominence=0.04, distance=5)
+    peaks = find_local_peaks(right, min_prominence=0.04, min_distance=5)
 
     count_penalty = 0.0
     if len(peaks) == 0:
@@ -159,10 +199,9 @@ def _template_curve() -> np.ndarray:
     anchors_x = np.array([0, 8, 16, 24, 30, 36, 44, 52, 60, 72, 88, 100, 108, 116, 127], dtype=float)
     anchors_y = np.array([0.18, 0.20, 0.55, 0.88, 0.78, 0.92, 0.60, 0.35, 0.32, 0.34, 0.33, 0.36, 0.55, 0.34, 0.32], dtype=float)
 
-    f = interp1d(anchors_x, anchors_y, kind="linear")
     x = np.linspace(0, 127, 128)
-    y = f(x)
-    y = savgol_filter(y, 11, 3)
+    y = np.interp(x, anchors_x, anchors_y)
+    y = moving_average(y, window=7)
 
     ymin, ymax = float(np.min(y)), float(np.max(y))
     return (y - ymin) / (ymax - ymin)

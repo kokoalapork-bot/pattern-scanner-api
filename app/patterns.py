@@ -1,8 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Iterable
-
-import numpy as np
+from typing import Iterable, List, Tuple
 
 TARGET_LEN = 128
 
@@ -19,45 +17,95 @@ class PatternBreakdown:
 
 
 def clamp01(x: float) -> float:
-    return float(max(0.0, min(1.0, x)))
+    return max(0.0, min(1.0, float(x)))
 
 
-def moving_average(y: np.ndarray, window: int = 7) -> np.ndarray:
+def mean(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def std(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    m = mean(values)
+    return math.sqrt(sum((v - m) ** 2 for v in values) / len(values))
+
+
+def median(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2
+
+
+def moving_average(y: List[float], window: int = 7) -> List[float]:
     if window <= 1 or len(y) < window:
-        return y.copy()
+        return y[:]
 
     if window % 2 == 0:
         window += 1
 
     pad = window // 2
-    padded = np.pad(y, (pad, pad), mode="edge")
-    kernel = np.ones(window, dtype=float) / window
-    smoothed = np.convolve(padded, kernel, mode="valid")
-    return smoothed
+    padded = [y[0]] * pad + y[:] + [y[-1]] * pad
+    out: List[float] = []
+
+    for i in range(len(y)):
+        chunk = padded[i:i + window]
+        out.append(sum(chunk) / window)
+
+    return out
 
 
-def normalize_series(close: Iterable[float], target_len: int = TARGET_LEN) -> np.ndarray:
-    arr = np.asarray(list(close), dtype=float)
-    arr = arr[np.isfinite(arr)]
+def linear_resample(values: List[float], target_len: int) -> List[float]:
+    if len(values) == target_len:
+        return values[:]
+    if len(values) == 1:
+        return [values[0]] * target_len
+
+    out: List[float] = []
+    last_index = len(values) - 1
+
+    for i in range(target_len):
+        pos = (i * last_index) / (target_len - 1)
+        left = int(math.floor(pos))
+        right = int(math.ceil(pos))
+
+        if left == right:
+            out.append(values[left])
+        else:
+            frac = pos - left
+            v = values[left] * (1 - frac) + values[right] * frac
+            out.append(v)
+
+    return out
+
+
+def normalize_series(close: Iterable[float], target_len: int = TARGET_LEN) -> List[float]:
+    arr = [float(x) for x in close if x is not None and math.isfinite(float(x))]
 
     if len(arr) < 30:
         raise ValueError("Need at least 30 data points to score a pattern")
 
-    x_old = np.arange(len(arr), dtype=float)
-    x_new = np.linspace(0, len(arr) - 1, target_len)
-    y = np.interp(x_new, x_old, arr)
-
+    y = linear_resample(arr, target_len)
     y = moving_average(y, window=7)
 
-    ymin, ymax = float(np.min(y)), float(np.max(y))
-    if math.isclose(ymax, ymin):
-        return np.zeros_like(y)
+    ymin = min(y)
+    ymax = max(y)
 
-    return (y - ymin) / (ymax - ymin)
+    if math.isclose(ymin, ymax):
+        return [0.0 for _ in y]
+
+    return [(v - ymin) / (ymax - ymin) for v in y]
 
 
-def find_local_peaks(y: np.ndarray, min_prominence: float = 0.04, min_distance: int = 4) -> np.ndarray:
-    peaks: list[int] = []
+def find_local_peaks(y: List[float], min_prominence: float = 0.04, min_distance: int = 4) -> List[int]:
+    peaks: List[int] = []
     last_peak = -10_000
 
     for i in range(1, len(y) - 1):
@@ -67,8 +115,8 @@ def find_local_peaks(y: np.ndarray, min_prominence: float = 0.04, min_distance: 
         left_start = max(0, i - min_distance)
         right_end = min(len(y), i + min_distance + 1)
 
-        left_min = float(np.min(y[left_start:i + 1]))
-        right_min = float(np.min(y[i:right_end]))
+        left_min = min(y[left_start:i + 1])
+        right_min = min(y[i:right_end])
         prominence = y[i] - max(left_min, right_min)
 
         if prominence < min_prominence:
@@ -83,58 +131,78 @@ def find_local_peaks(y: np.ndarray, min_prominence: float = 0.04, min_distance: 
         peaks.append(i)
         last_peak = i
 
-    return np.asarray(peaks, dtype=int)
+    return peaks
 
 
-def crown_score(y: np.ndarray) -> float:
+def simple_slope(values: List[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+
+    x_mean = (n - 1) / 2
+    y_mean = mean(values)
+
+    num = 0.0
+    den = 0.0
+    for i, v in enumerate(values):
+        dx = i - x_mean
+        num += dx * (v - y_mean)
+        den += dx * dx
+
+    if den == 0:
+        return 0.0
+    return num / den
+
+
+def crown_score(y: List[float]) -> float:
     left = y[:52]
     peaks = find_local_peaks(left, min_prominence=0.04, min_distance=4)
 
     if len(peaks) < 3:
         return 0.0
 
-    peak_vals = left[peaks]
+    peak_vals = [left[i] for i in peaks]
     count_score = 1.0 if 3 <= len(peaks) <= 6 else clamp01(1 - abs(len(peaks) - 4) * 0.18)
 
-    mean_val = float(np.mean(peak_vals))
-    std_val = float(np.std(peak_vals))
+    mean_val = mean(peak_vals)
+    std_val = std(peak_vals)
     consistency = clamp01(1.0 - (std_val / (mean_val + 1e-9)))
 
-    top_zone_score = float(np.mean(peak_vals > 0.72))
-    uneven_top_bonus = clamp01(float(np.std(np.diff(peaks))) / 12.0) if len(peaks) > 1 else 0.0
+    top_zone_score = sum(1 for v in peak_vals if v > 0.72) / len(peak_vals)
+    spacing = [peaks[i + 1] - peaks[i] for i in range(len(peaks) - 1)]
+    uneven_top_bonus = clamp01(std(spacing) / 12.0) if spacing else 0.0
 
     score = 0.38 * count_score + 0.30 * consistency + 0.22 * top_zone_score + 0.10 * uneven_top_bonus
     return clamp01(score)
 
 
-def drop_score(y: np.ndarray) -> float:
-    peak_idx = int(np.argmax(y[:60]))
+def drop_score(y: List[float]) -> float:
+    peak_idx = max(range(min(60, len(y))), key=lambda i: y[i])
     post = y[peak_idx:84]
 
     if len(post) < 8:
         return 0.0
 
-    local_floor = float(np.min(post))
-    drop = float(y[peak_idx] - local_floor)
+    local_floor = min(post)
+    drop = y[peak_idx] - local_floor
 
-    recovery = float(np.max(post[-8:]) - local_floor)
+    recovery = max(post[-8:]) - local_floor
     recovery_penalty = clamp01(recovery / 0.25)
 
     score = clamp01(drop / 0.45) * (1 - 0.35 * recovery_penalty)
     return clamp01(score)
 
 
-def shelf_score(y: np.ndarray) -> float:
+def shelf_score(y: List[float]) -> float:
     mid = y[48:100]
     if len(mid) < 20:
         return 0.0
 
-    x = np.arange(len(mid), dtype=float)
-    slope = abs(float(np.polyfit(x, mid, 1)[0]))
-    std = float(np.std(mid))
-    mid_range = float(np.max(mid) - np.min(mid))
+    slope = abs(simple_slope(mid))
+    s = std(mid)
+    mid_range = max(mid) - min(mid)
 
-    flatness = clamp01(1 - std / 0.12)
+    flatness = clamp01(1 - s / 0.12)
     slope_score = clamp01(1 - slope / 0.0045)
     narrowness = clamp01(1 - mid_range / 0.28)
 
@@ -142,13 +210,13 @@ def shelf_score(y: np.ndarray) -> float:
     return clamp01(score)
 
 
-def right_spike_score(y: np.ndarray) -> float:
+def right_spike_score(y: List[float]) -> float:
     right = y[84:116]
     if len(right) < 12:
         return 0.0
 
-    base = float(np.median(right))
-    peak = float(np.max(right))
+    base = median(right)
+    peak = max(right)
     spike = peak - base
 
     peaks = find_local_peaks(right, min_prominence=0.04, min_distance=5)
@@ -163,15 +231,14 @@ def right_spike_score(y: np.ndarray) -> float:
     return clamp01(spike_strength * (1 - count_penalty))
 
 
-def reversion_score(y: np.ndarray) -> float:
+def reversion_score(y: List[float]) -> float:
     tail = y[116:128]
-
     if len(tail) < 8:
         return 0.0
 
-    tail_mean = float(np.mean(tail))
-    tail_std = float(np.std(tail))
-    pre_tail_base = float(np.median(y[96:110]))
+    tail_mean = mean(tail)
+    tail_std = std(tail)
+    pre_tail_base = median(y[96:110])
 
     returned_to_base = clamp01(1 - abs(tail_mean - pre_tail_base) / 0.18)
     flat_tail = clamp01(1 - tail_std / 0.10)
@@ -181,12 +248,12 @@ def reversion_score(y: np.ndarray) -> float:
     return clamp01(score)
 
 
-def asymmetry_score(y: np.ndarray) -> float:
+def asymmetry_score(y: List[float]) -> float:
     left = y[:64]
     right = y[64:]
 
-    left_complexity = float(np.sum(np.abs(np.diff(left))))
-    right_complexity = float(np.sum(np.abs(np.diff(right))))
+    left_complexity = sum(abs(left[i + 1] - left[i]) for i in range(len(left) - 1))
+    right_complexity = sum(abs(right[i + 1] - right[i]) for i in range(len(right) - 1))
 
     if left_complexity <= 1e-9:
         return 0.0
@@ -195,23 +262,44 @@ def asymmetry_score(y: np.ndarray) -> float:
     return clamp01(1 - max(0.0, ratio - 0.55) / 0.75)
 
 
-def _template_curve() -> np.ndarray:
-    anchors_x = np.array([0, 8, 16, 24, 30, 36, 44, 52, 60, 72, 88, 100, 108, 116, 127], dtype=float)
-    anchors_y = np.array([0.18, 0.20, 0.55, 0.88, 0.78, 0.92, 0.60, 0.35, 0.32, 0.34, 0.33, 0.36, 0.55, 0.34, 0.32], dtype=float)
+def template_curve() -> List[float]:
+    anchors: List[Tuple[float, float]] = [
+        (0, 0.18), (8, 0.20), (16, 0.55), (24, 0.88), (30, 0.78),
+        (36, 0.92), (44, 0.60), (52, 0.35), (60, 0.32), (72, 0.34),
+        (88, 0.33), (100, 0.36), (108, 0.55), (116, 0.34), (127, 0.32),
+    ]
 
-    x = np.linspace(0, 127, 128)
-    y = np.interp(x, anchors_x, anchors_y)
-    y = moving_average(y, window=7)
+    xs = [a[0] for a in anchors]
+    ys = [a[1] for a in anchors]
 
-    ymin, ymax = float(np.min(y)), float(np.max(y))
-    return (y - ymin) / (ymax - ymin)
+    out: List[float] = []
+    for i in range(128):
+        if i <= xs[0]:
+            out.append(ys[0])
+            continue
+        if i >= xs[-1]:
+            out.append(ys[-1])
+            continue
+
+        for j in range(len(xs) - 1):
+            if xs[j] <= i <= xs[j + 1]:
+                left_x, right_x = xs[j], xs[j + 1]
+                left_y, right_y = ys[j], ys[j + 1]
+                frac = (i - left_x) / (right_x - left_x)
+                out.append(left_y * (1 - frac) + right_y * frac)
+                break
+
+    out = moving_average(out, window=7)
+    ymin = min(out)
+    ymax = max(out)
+    return [(v - ymin) / (ymax - ymin) for v in out]
 
 
-_TEMPLATE = _template_curve()
+_TEMPLATE = template_curve()
 
 
-def template_shape_score(y: np.ndarray) -> float:
-    mad = float(np.mean(np.abs(y - _TEMPLATE)))
+def template_shape_score(y: List[float]) -> float:
+    mad = mean([abs(a - b) for a, b in zip(y, _TEMPLATE)])
     return clamp01(1 - mad / 0.28)
 
 

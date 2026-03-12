@@ -9,6 +9,9 @@ app = FastAPI(
     title="Crypto Pattern Scanner API",
     version="1.0.0",
     description="Scans recently listed crypto assets and ranks them by similarity to the crown-shelf-right-spike daily-chart silhouette.",
+    servers=[
+        {"url": "https://ТВОЙ-ДОМЕН.onrender.com"}
+    ],
 )
 
 

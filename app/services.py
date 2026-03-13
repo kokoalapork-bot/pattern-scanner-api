@@ -1,3 +1,5 @@
+# services.py
+
 from dataclasses import asdict
 from typing import Dict, List, Optional
 
@@ -225,6 +227,9 @@ def mark_skipped(
     http_status: int | None = None,
     request_params: dict | None = None,
     error_message: str | None = None,
+    auth_mode: str | None = None,
+    base_url: str | None = None,
+    api_key_present: bool | None = None,
 ):
     if symbol not in skipped_symbols:
         skipped_symbols.append(symbol)
@@ -239,6 +244,9 @@ def mark_skipped(
         http_status=http_status,
         request_params=request_params,
         error_message=error_message,
+        auth_mode=auth_mode,
+        base_url=base_url,
+        api_key_present=api_key_present,
     )
 
 
@@ -329,6 +337,8 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 )
                 continue
 
+            history_days = min(450, req.max_age_days if not explicit_mode else 450)
+
             debug_by_symbol[symbol] = DebugSymbolInfo(
                 resolved=True,
                 coingecko_id=coin_id,
@@ -336,13 +346,16 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 stage="fetch_market_data",
                 reason=None,
                 endpoint="/coins/{id}/market_chart",
-                request_params={"vs_currency": req.vs_currency, "days": str(min(450, req.max_age_days if not explicit_mode else 450)), "interval": "daily"},
+                request_params={"vs_currency": req.vs_currency, "days": str(history_days), "interval": "daily"},
+                auth_mode=client.auth_mode,
+                base_url=client.base_url,
+                api_key_present=client.api_key_present,
             )
 
             fetch = await client.fetch_market_chart_safe(
                 coin_id=coin_id,
                 vs_currency=req.vs_currency,
-                days=min(450, req.max_age_days if not explicit_mode else 450),
+                days=history_days,
             )
 
             if not fetch.ok:
@@ -358,10 +371,32 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     http_status=fetch.http_status,
                     request_params=fetch.request_params,
                     error_message=fetch.error_message,
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
                 )
                 continue
 
             chart = fetch.chart
+            if not isinstance(chart, dict):
+                mark_skipped(
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason="history_bad_response_schema",
+                    stage="fetch_market_data",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
+                    endpoint=fetch.endpoint,
+                    http_status=fetch.http_status,
+                    request_params=fetch.request_params,
+                    error_message="chart is not a dict",
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
+                )
+                continue
+
             closes = coingecko_daily_closes(chart)
 
             if len(closes) == 0:
@@ -369,7 +404,12 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     symbol, coin_id, "history_empty", "fetch_market_data",
                     skipped_symbols, skip_reasons, debug_by_symbol,
                     endpoint=fetch.endpoint,
+                    http_status=fetch.http_status,
                     request_params=fetch.request_params,
+                    error_message="prices list is empty after close extraction",
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
                 )
                 continue
 
@@ -378,7 +418,12 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     symbol, coin_id, "insufficient_history", "fetch_market_data",
                     skipped_symbols, skip_reasons, debug_by_symbol,
                     endpoint=fetch.endpoint,
+                    http_status=fetch.http_status,
                     request_params=fetch.request_params,
+                    error_message=f"need >= 30 closes, got {len(closes)}",
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
                 )
                 continue
 
@@ -388,7 +433,12 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     symbol, coin_id, "history_bad_response_schema", "fetch_market_data",
                     skipped_symbols, skip_reasons, debug_by_symbol,
                     endpoint=fetch.endpoint,
+                    http_status=fetch.http_status,
                     request_params=fetch.request_params,
+                    error_message="unable to derive age from chart prices",
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
                 )
                 continue
 
@@ -406,6 +456,13 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 status="building_windows",
                 stage="build_windows",
                 reason=None,
+                endpoint=fetch.endpoint,
+                http_status=200,
+                request_params=fetch.request_params,
+                error_message=None,
+                auth_mode=fetch.auth_mode,
+                base_url=fetch.base_url,
+                api_key_present=fetch.api_key_present,
             )
 
             try:
@@ -415,13 +472,19 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     symbol, coin_id, "window_generation_failed", "build_windows",
                     skipped_symbols, skip_reasons, debug_by_symbol,
                     error_message=f"{type(e).__name__}: {e}",
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
                 )
                 continue
 
             if best is None:
                 mark_skipped(
                     symbol, coin_id, "no_valid_windows", "build_windows",
-                    skipped_symbols, skip_reasons, debug_by_symbol
+                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
                 )
                 continue
 
@@ -432,6 +495,13 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 status="evaluated",
                 stage="score_windows",
                 reason=None,
+                endpoint=fetch.endpoint,
+                http_status=200,
+                request_params=fetch.request_params,
+                error_message=None,
+                auth_mode=fetch.auth_mode,
+                base_url=fetch.base_url,
+                api_key_present=fetch.api_key_present,
             )
 
             notes = list(best["notes"])

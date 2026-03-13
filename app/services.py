@@ -107,7 +107,6 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
         closes, min_age_days, max_age_days
     ):
         candidate_windows_count += 1
-
         result = score_crown_shelf_right_spike(window_closes)
 
         pos = position_bonus(start_idx, end_idx, total_len)
@@ -149,7 +148,7 @@ def resolve_requested_coins(
     markets: list[dict],
     symbols: Optional[list[str]],
     coingecko_ids: Optional[list[str]],
-) -> tuple[list[dict], list[str], list[str], dict[str, str], dict[str, DebugSymbolInfo]]:
+):
     resolved: list[dict] = []
     resolved_symbols: list[str] = []
     unresolved_symbols: list[str] = []
@@ -190,11 +189,7 @@ def resolve_requested_coins(
             key = sym.lower()
             matches = by_symbol.get(key, [])
             if matches:
-                chosen = sorted(
-                    matches,
-                    key=lambda x: float(x.get("market_cap") or 0),
-                    reverse=True,
-                )[0]
+                chosen = sorted(matches, key=lambda x: float(x.get("market_cap") or 0), reverse=True)[0]
                 resolved.append(chosen)
                 resolved_symbols.append(sym.upper())
                 debug_by_symbol[sym.upper()] = DebugSymbolInfo(
@@ -226,6 +221,10 @@ def mark_skipped(
     skipped_symbols: list[str],
     skip_reasons: dict[str, str],
     debug_by_symbol: dict[str, DebugSymbolInfo],
+    endpoint: str | None = None,
+    http_status: int | None = None,
+    request_params: dict | None = None,
+    error_message: str | None = None,
 ):
     if symbol not in skipped_symbols:
         skipped_symbols.append(symbol)
@@ -236,6 +235,10 @@ def mark_skipped(
         status="skipped",
         stage=stage,
         reason=reason,
+        endpoint=endpoint,
+        http_status=http_status,
+        request_params=request_params,
+        error_message=error_message,
     )
 
 
@@ -332,6 +335,8 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 status="fetching",
                 stage="fetch_market_data",
                 reason=None,
+                endpoint="/coins/{id}/market_chart",
+                request_params={"vs_currency": req.vs_currency, "days": str(min(450, req.max_age_days if not explicit_mode else 450)), "interval": "daily"},
             )
 
             fetch = await client.fetch_market_chart_safe(
@@ -342,32 +347,48 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
             if not fetch.ok:
                 mark_skipped(
-                    symbol, coin_id, fetch.reason or "market_data_fetch_failed", "fetch_market_data",
-                    skipped_symbols, skip_reasons, debug_by_symbol
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason=fetch.reason or "history_fetch_failed",
+                    stage="fetch_market_data",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
+                    endpoint=fetch.endpoint,
+                    http_status=fetch.http_status,
+                    request_params=fetch.request_params,
+                    error_message=fetch.error_message,
                 )
                 continue
 
             chart = fetch.chart
             closes = coingecko_daily_closes(chart)
+
             if len(closes) == 0:
                 mark_skipped(
-                    symbol, coin_id, "empty_history", "fetch_market_data",
-                    skipped_symbols, skip_reasons, debug_by_symbol
+                    symbol, coin_id, "history_empty", "fetch_market_data",
+                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    endpoint=fetch.endpoint,
+                    request_params=fetch.request_params,
                 )
                 continue
 
             if len(closes) < 30:
                 mark_skipped(
                     symbol, coin_id, "insufficient_history", "fetch_market_data",
-                    skipped_symbols, skip_reasons, debug_by_symbol
+                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    endpoint=fetch.endpoint,
+                    request_params=fetch.request_params,
                 )
                 continue
 
             asset_age_days = age_from_chart_days(chart)
             if asset_age_days is None:
                 mark_skipped(
-                    symbol, coin_id, "bad_response_schema", "fetch_market_data",
-                    skipped_symbols, skip_reasons, debug_by_symbol
+                    symbol, coin_id, "history_bad_response_schema", "fetch_market_data",
+                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    endpoint=fetch.endpoint,
+                    request_params=fetch.request_params,
                 )
                 continue
 
@@ -389,10 +410,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
             try:
                 best = find_best_window(closes, req.min_age_days, req.max_age_days)
-            except Exception:
+            except Exception as e:
                 mark_skipped(
                     symbol, coin_id, "window_generation_failed", "build_windows",
-                    skipped_symbols, skip_reasons, debug_by_symbol
+                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    error_message=f"{type(e).__name__}: {e}",
                 )
                 continue
 
@@ -404,7 +426,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 continue
 
             evaluated_symbols.append(symbol)
-
             debug_by_symbol[symbol] = DebugSymbolInfo(
                 resolved=True,
                 coingecko_id=coin_id,

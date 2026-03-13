@@ -36,8 +36,8 @@ FEATURE_KEYS = [
     "template_shape",
 ]
 
-# Seed calibration profiles for exemplar-consistency.
-# Pattern remains primary; these only constrain valid market-shaped variants.
+# Эталонные диапазоны — не nearest-neighbor, а калибровка допустимой формы.
+# Они задают "зону валидной базы", а не заменяют паттерн.
 EXEMPLAR_BREAKDOWNS: dict[str, dict[str, float]] = {
     "SIREN": {
         "crown": 0.42,
@@ -59,11 +59,13 @@ EXEMPLAR_BREAKDOWNS: dict[str, dict[str, float]] = {
     },
 }
 
+# lower tolerance, upper tolerance
+# crown intentionally loose on lower side so weak-crown variants can survive.
 REFERENCE_TOLERANCES: dict[str, tuple[float, float]] = {
-    "crown": (0.20, 0.18),       # lower tolerance, upper tolerance
-    "drop": (0.14, 0.16),
-    "shelf": (0.18, 0.16),
-    "right_spike": (0.18, 0.18),
+    "crown": (0.22, 0.16),
+    "drop": (0.16, 0.16),
+    "shelf": (0.20, 0.16),
+    "right_spike": (0.18, 0.16),
     "reversion": (0.18, 0.18),
     "asymmetry": (0.18, 0.18),
     "template_shape": (0.16, 0.16),
@@ -121,6 +123,15 @@ def iter_windows(closes: list[float], min_age_days: int, max_age_days: int):
 
 
 def position_bonus(start_idx: int, end_idx: int, total_len: int) -> float:
+    """
+    Нам нужна именно база перед выходом, а не окно, которое заканчивается
+    в самой правой точке графика после уже состоявшегося пампа.
+
+    Поэтому:
+    - сильный штраф, если окно упирается в край,
+    - бонус, если справа остается небольшой, но не нулевой хвост,
+    - штраф за слишком ранние окна.
+    """
     if total_len <= 0:
         return 0.0
 
@@ -129,23 +140,27 @@ def position_bonus(start_idx: int, end_idx: int, total_len: int) -> float:
     right_tail = total_len - end_idx
 
     if end_ratio < 0.35:
-        return 0.35
+        return 0.25
 
+    # После базы должен оставаться небольшой запас справа.
     if right_tail <= 1:
-        return 0.20
+        return 0.10
     if right_tail <= 3:
-        return 0.40
-    if right_tail <= 5:
-        return 0.60
+        return 0.30
+    if right_tail <= 6:
+        return 0.55
+    if right_tail <= 14:
+        return 1.00
 
+    # Если справа слишком много хвоста, окно слишком раннее.
     target = 0.82
     distance = abs(end_ratio - target)
     pos_score = max(0.0, 1.0 - distance / 0.35)
 
     if start_ratio > 0.80:
-        pos_score *= 0.60
+        pos_score *= 0.55
     elif start_ratio > 0.70:
-        pos_score *= 0.80
+        pos_score *= 0.78
 
     return max(0.0, min(1.0, pos_score))
 
@@ -189,7 +204,6 @@ def compute_exemplar_metrics(breakdown) -> dict[str, float | bool]:
     distance_to_river = mean_abs_distance(candidate, EXEMPLAR_BREAKDOWNS["RIVER"])
     nearest_distance = min(distance_to_siren, distance_to_river)
 
-    # soft calibration score: 0..100, bounded and not replacing structural score
     exemplar_consistency = max(0.0, 100.0 * (1.0 - min(1.0, nearest_distance / 0.45)))
     reference_band_passed = compute_reference_band_passed(candidate)
 
@@ -201,12 +215,71 @@ def compute_exemplar_metrics(breakdown) -> dict[str, float | bool]:
     }
 
 
+def compute_pre_breakout_guardrails(
+    *,
+    breakdown_dict: dict[str, float],
+    stage: str,
+    best_window_end: int,
+    total_len: int,
+) -> dict[str, float | bool]:
+    """
+    Жесткие визуальные guardrails именно под твое требование:
+    нужен не памп, а база до пампа.
+
+    Ключевые идеи:
+    - long shelf must be real
+    - crown/spikes inside base are allowed
+    - right edge should show preparation, not already fully gone
+    - окно не должно заканчиваться на самом правом выносе
+    """
+    shelf = breakdown_dict["shelf"]
+    crown = breakdown_dict["crown"]
+    spike = breakdown_dict["right_spike"]
+    reversion = breakdown_dict["reversion"]
+    template = breakdown_dict["template_shape"]
+
+    right_tail = max(0, total_len - best_window_end)
+    pre_breakout_tail_ok = 3 <= right_tail <= 20
+    left_structure_ok = (
+        shelf >= 0.55
+        and template >= 0.50
+        and crown >= 0.18
+        and spike >= 0.35
+        and reversion >= 0.30
+    )
+
+    # active/forming are preferred for "base before breakout".
+    stage_ok = stage in {"forming", "active"}
+
+    # full pre-breakout base confidence
+    pre_breakout_base_score = 0.0
+    pre_breakout_base_score += min(1.0, max(0.0, (shelf - 0.45) / 0.35)) * 0.30
+    pre_breakout_base_score += min(1.0, max(0.0, (template - 0.40) / 0.35)) * 0.20
+    pre_breakout_base_score += min(1.0, max(0.0, (crown - 0.10) / 0.35)) * 0.15
+    pre_breakout_base_score += min(1.0, max(0.0, (spike - 0.25) / 0.40)) * 0.15
+    pre_breakout_base_score += min(1.0, max(0.0, (reversion - 0.20) / 0.35)) * 0.10
+    pre_breakout_base_score += (1.0 if pre_breakout_tail_ok else 0.0) * 0.10
+    pre_breakout_base_score = round(pre_breakout_base_score * 100.0, 2)
+
+    return {
+        "left_structure_ok": left_structure_ok,
+        "pre_breakout_tail_ok": pre_breakout_tail_ok,
+        "stage_ok": stage_ok,
+        "pre_breakout_base_score": pre_breakout_base_score,
+    }
+
+
 def classify_final_label(
+    *,
     base_label: str,
     structural_score: float,
     exemplar_consistency_score: float,
     reference_band_passed: bool,
     universe_filter_status: str,
+    left_structure_ok: bool,
+    pre_breakout_tail_ok: bool,
+    stage_ok: bool,
+    pre_breakout_base_score: float,
 ) -> str:
     if universe_filter_status != "included_for_scoring":
         return "reject"
@@ -214,10 +287,22 @@ def classify_final_label(
     if structural_score < 30.0:
         return "reject"
 
-    if structural_score >= 65.0 and exemplar_consistency_score >= 55.0 and reference_band_passed:
+    if not left_structure_ok:
+        return "reject"
+
+    # Strong match only if real pre-breakout base is present on the left,
+    # reference band is passed, and the candidate is not just "right-edge pump".
+    if (
+        structural_score >= 62.0
+        and exemplar_consistency_score >= 55.0
+        and reference_band_passed
+        and pre_breakout_tail_ok
+        and stage_ok
+        and pre_breakout_base_score >= 62.0
+    ):
         return "strong match"
 
-    if structural_score >= 45.0 and exemplar_consistency_score >= 30.0:
+    if structural_score >= 45.0 and exemplar_consistency_score >= 32.0 and pre_breakout_base_score >= 45.0:
         if base_label == "weak-crown variant":
             return "weak-crown variant"
         return "partial match"
@@ -250,15 +335,31 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
 
         pos = position_bonus(start_idx, end_idx, total_len)
         structural_score = float(result.similarity)
-        effective_structural = structural_score * (0.72 + 0.28 * pos)
+        effective_structural = structural_score * (0.70 + 0.30 * pos)
 
+        # If the window ends right at the edge, it is likely just the breakout/pump zone.
         if (total_len - end_idx) <= 1:
-            effective_structural *= 0.50
+            effective_structural *= 0.40
 
         exemplar_metrics = compute_exemplar_metrics(result.breakdown)
+        breakdown_dict = breakdown_to_dict(result.breakdown)
+        pre_breakout = compute_pre_breakout_guardrails(
+            breakdown_dict=breakdown_dict,
+            stage=result.stage,
+            best_window_end=end_idx,
+            total_len=total_len,
+        )
+
+        # Final blended score still remains pattern-first.
         final_score = combine_scores(
             structural_score=effective_structural,
             exemplar_consistency_score=float(exemplar_metrics["exemplar_consistency_score"]),
+        )
+
+        # Small additional preference for true pre-breakout bases.
+        final_score = round(
+            final_score * (0.82 + 0.18 * (float(pre_breakout["pre_breakout_base_score"]) / 100.0)),
+            2,
         )
 
         if final_score > best_effective:
@@ -279,6 +380,10 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
                 "distance_to_siren_breakdown": float(exemplar_metrics["distance_to_siren_breakdown"]),
                 "distance_to_river_breakdown": float(exemplar_metrics["distance_to_river_breakdown"]),
                 "reference_band_passed": bool(exemplar_metrics["reference_band_passed"]),
+                "left_structure_ok": bool(pre_breakout["left_structure_ok"]),
+                "pre_breakout_tail_ok": bool(pre_breakout["pre_breakout_tail_ok"]),
+                "stage_ok": bool(pre_breakout["stage_ok"]),
+                "pre_breakout_base_score": float(pre_breakout["pre_breakout_base_score"]),
             }
 
     if best is None:
@@ -848,6 +953,10 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 exemplar_consistency_score=float(best["exemplar_consistency_score"]),
                 reference_band_passed=bool(best["reference_band_passed"]),
                 universe_filter_status="included_for_scoring",
+                left_structure_ok=bool(best["left_structure_ok"]),
+                pre_breakout_tail_ok=bool(best["pre_breakout_tail_ok"]),
+                stage_ok=bool(best["stage_ok"]),
+                pre_breakout_base_score=float(best["pre_breakout_base_score"]),
             )
 
             if final_label == "reject":
@@ -927,6 +1036,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             notes.append(
                 f"Distances: siren={best['distance_to_siren_breakdown']}, "
                 f"river={best['distance_to_river_breakdown']}"
+            )
+            notes.append(
+                f"Pre-breakout base score: {best['pre_breakout_base_score']} | "
+                f"tail_ok={best['pre_breakout_tail_ok']} | "
+                f"left_structure_ok={best['left_structure_ok']}"
             )
             if not best["reference_band_passed"]:
                 notes.append("Reference band guardrail failed: cannot be promoted to strong match.")

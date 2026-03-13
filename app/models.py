@@ -1,4 +1,4 @@
-from typing import Literal, Optional, Dict
+from typing import Literal, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 PatternName = Literal["crown_shelf_right_spike"]
@@ -42,6 +42,10 @@ class DebugSymbolInfo(BaseModel):
     status: str = "unknown"
     stage: str = "unknown"
     reason: str | None = None
+    endpoint: str | None = None
+    http_status: int | None = None
+    request_params: Dict[str, Any] | None = None
+    error_message: str | None = None
 
 
 class ScanResult(BaseModel):

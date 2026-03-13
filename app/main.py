@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .config import settings
+from .data_sources import build_coingecko_auth
 from .models import ErrorResponse, ScanRequest, ScanResponse
 from .services import scan_pattern
 
@@ -29,6 +30,11 @@ app = FastAPI(
     description="Scans recently listed crypto assets and ranks them by similarity to the crown-shelf-right-spike daily-chart silhouette.",
     servers=[{"url": BASE_URL}],
 )
+
+
+@app.on_event("startup")
+async def validate_integrations() -> None:
+    build_coingecko_auth()
 
 
 @app.get("/health", response_model=HealthResponse)

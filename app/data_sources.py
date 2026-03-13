@@ -1,5 +1,3 @@
-# data_sources.py
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -53,7 +51,6 @@ class CoinGeckoClient:
     def __init__(self) -> None:
         headers = {"accept": "application/json"}
 
-        # У тебя demo key: для Demo API нужен именно x-cg-demo-api-key
         api_key = str(getattr(settings, "coingecko_api_key", "") or "").strip()
         if api_key:
             headers["x-cg-demo-api-key"] = api_key
@@ -125,13 +122,6 @@ class CoinGeckoClient:
         vs_currency: str = "usd",
         days: int | str = 450,
     ) -> MarketDataFetchResult:
-        """
-        Fetch history by coingecko_id only.
-        Demo auth only:
-          - base_url: https://api.coingecko.com/api/v3
-          - header: x-cg-demo-api-key
-        Adds retry/backoff for 429 and returns structured debug info.
-        """
         if not coin_id:
             return MarketDataFetchResult(
                 ok=False,
@@ -355,10 +345,6 @@ def coingecko_daily_closes(chart: dict[str, Any]) -> list[float]:
         if day_key in seen_days:
             closes[-1] = price_f
         else:
-            seen_days.add(day_key)
-            closes.append(price_f)
-
-    return closes
             seen_days.add(day_key)
             closes.append(price_f)
 

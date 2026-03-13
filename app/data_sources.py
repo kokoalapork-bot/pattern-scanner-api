@@ -4,14 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import asyncio
+import math
 
 import httpx
 
 from .config import settings
-
-STABLE_SYMBOLS = {
-    "usdt", "usdc", "dai", "fdusd", "tusd", "gusd", "frax", "frxusd", "usdh", "dusd", "usdon", "fidd"
-}
 
 TOKENIZED_STOCK_KEYWORDS = [
     "tokenized stock",
@@ -29,6 +26,48 @@ TOKENIZED_STOCK_KEYWORDS = [
     "silver trust",
     "gold",
 ]
+
+MAJOR_EXCLUDED_SYMBOLS = {"btc", "eth"}
+MAJOR_EXCLUDED_IDS = {"bitcoin", "ethereum"}
+
+STABLE_SYMBOLS = {
+    "usdt", "usdc", "dai", "fdusd", "tusd", "gusd", "frax", "frxusd",
+    "usdh", "dusd", "usdon", "fidd", "usde", "pyusd", "eurc", "eurs",
+    "susd", "usdp", "lusd", "rlusd", "usdm", "usdx", "eurt", "celo-dollar",
+}
+
+STABLE_IDS = {
+    "tether",
+    "usd-coin",
+    "dai",
+    "first-digital-usd",
+    "true-usd",
+    "gemini-dollar",
+    "frax",
+    "frax-price-index-share",
+    "paypal-usd",
+    "usde",
+    "pax-dollar",
+    "stasis-eurs",
+    "celo-dollar",
+    "ethena-usde",
+    "curve-fi-amdai-amusdc-amusdt",
+}
+
+STABLE_NAME_KEYWORDS = [
+    "stablecoin",
+    "wrapped usd",
+    "synthetic dollar",
+    "synthetic usd",
+    "yield usd",
+    "yield-bearing usd",
+    "euro stable",
+    "usd coin",
+    "digital dollar",
+    "dollar",
+    "euro coin",
+]
+
 
 DEMO_HISTORY_MAX_DAYS = 365
 
@@ -96,6 +135,85 @@ def get_history_plan_limit_days(auth_mode: str) -> int | None:
     if auth_mode == "demo":
         return DEMO_HISTORY_MAX_DAYS
     return None
+
+
+def _mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _stdev(xs: list[float]) -> float:
+    if len(xs) < 2:
+        return 0.0
+    m = _mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+
+
+def looks_like_major(symbol: str, coingecko_id: str) -> tuple[bool, str | None]:
+    s = symbol.lower()
+    cid = coingecko_id.lower()
+
+    if s == "btc" or cid == "bitcoin":
+        return True, "excluded_btc"
+    if s == "eth" or cid == "ethereum":
+        return True, "excluded_eth"
+    if s in MAJOR_EXCLUDED_SYMBOLS or cid in MAJOR_EXCLUDED_IDS:
+        return True, "excluded_major"
+    return False, None
+
+
+def looks_like_stable(symbol: str, name: str, coingecko_id: str | None = None) -> bool:
+    s = symbol.lower()
+    n = name.lower()
+    cid = (coingecko_id or "").lower()
+
+    if s in STABLE_SYMBOLS:
+        return True
+    if cid in STABLE_IDS:
+        return True
+    if " usd" in n or n.endswith(" usd") or "stable" in n:
+        return True
+    return any(keyword in n for keyword in STABLE_NAME_KEYWORDS)
+
+
+def looks_like_tokenized_stock(name: str) -> bool:
+    n = name.lower()
+    return any(keyword in n for keyword in TOKENIZED_STOCK_KEYWORDS)
+
+
+def price_behavior_metrics(closes: list[float]) -> dict[str, float]:
+    if not closes:
+        return {"mean": 0.0, "stdev": 0.0, "cv": 0.0, "range_ratio": 0.0}
+
+    avg = _mean(closes)
+    sd = _stdev(closes)
+    lo = min(closes)
+    hi = max(closes)
+    cv = 0.0 if avg == 0 else sd / avg
+    range_ratio = 0.0 if avg == 0 else (hi - lo) / avg
+
+    return {
+        "mean": avg,
+        "stdev": sd,
+        "cv": cv,
+        "range_ratio": range_ratio,
+    }
+
+
+def classify_behavioral_universe_filter(closes: list[float]) -> tuple[str, str]:
+    metrics = price_behavior_metrics(closes)
+    avg = metrics["mean"]
+    cv = metrics["cv"]
+    range_ratio = metrics["range_ratio"]
+
+    near_peg = abs(avg - settings.stable_price_peg_center) <= settings.stable_price_peg_tolerance
+
+    if near_peg and cv <= settings.stable_max_cv and range_ratio <= settings.stable_max_range_ratio:
+        return "excluded_stablecoin", "excluded_stablecoin_behavior"
+
+    if cv <= settings.low_volatility_max_cv and range_ratio <= settings.low_volatility_max_range_ratio:
+        return "excluded_low_volatility", "excluded_low_volatility"
+
+    return "included_for_scoring", "included_for_scoring"
 
 
 class CoinGeckoClient:
@@ -168,8 +286,9 @@ class CoinGeckoClient:
         days: int | str = 450,
         interval: str = "daily",
     ) -> MarketDataFetchResult:
+        normalized_days, capped = self.normalize_history_days(days)
+
         if not coingecko_id:
-            normalized_days, capped = self.normalize_history_days(days)
             return MarketDataFetchResult(
                 ok=False,
                 reason="coingecko_id_missing",
@@ -185,7 +304,6 @@ class CoinGeckoClient:
                 **self.auth_debug(),
             )
 
-        normalized_days, capped = self.normalize_history_days(days)
         endpoint = f"/coins/{coingecko_id}/market_chart"
         request_params = {
             "vs_currency": vs_currency,
@@ -202,11 +320,14 @@ class CoinGeckoClient:
 
         for attempt in range(retries):
             try:
-                resp = await self.client.get(endpoint, params={
-                    "vs_currency": vs_currency,
-                    "days": str(normalized_days),
-                    "interval": interval,
-                })
+                resp = await self.client.get(
+                    endpoint,
+                    params={
+                        "vs_currency": vs_currency,
+                        "days": str(normalized_days),
+                        "interval": interval,
+                    },
+                )
                 resp.raise_for_status()
                 payload = resp.json()
 
@@ -301,7 +422,7 @@ class CoinGeckoClient:
                             reason="history_range_exceeds_plan_limit",
                             error_message=(
                                 f"Demo plan requested {request_params['requested_days']} days, "
-                                f"plan limit is {DEMO_HISTORY_MAX_DAYS}. Original upstream error: {error_message}"
+                                f"plan limit is {DEMO_HISTORY_MAX_DAYS}. Upstream error: {error_message}"
                             ),
                             endpoint="/coins/{id}/market_chart",
                             http_status=status,
@@ -395,17 +516,6 @@ class CoinGeckoClient:
             request_params=request_params,
             **self.auth_debug(),
         )
-
-
-def looks_like_stable(symbol: str, name: str) -> bool:
-    s = symbol.lower()
-    n = name.lower()
-    return s in STABLE_SYMBOLS or " usd" in n or n.endswith(" usd") or "stable" in n
-
-
-def looks_like_tokenized_stock(name: str) -> bool:
-    n = name.lower()
-    return any(keyword in n for keyword in TOKENIZED_STOCK_KEYWORDS)
 
 
 def coingecko_daily_closes(chart: dict[str, Any]) -> list[float]:

@@ -39,6 +39,9 @@ class BestWindow(BaseModel):
 
 class DebugSymbolInfo(BaseModel):
     input_symbol: str | None = None
+    input_coingecko_id: str | None = None
+    source_type: str | None = None  # "symbol" | "coingecko_id" | "mixed"
+
     resolved: bool = False
     coingecko_id: str | None = None
     status: str = "unknown"
@@ -108,16 +111,20 @@ class ScanResponse(BaseModel):
 
     resolved_symbols: list[str] = []
     unresolved_symbols: list[str] = []
+
+    resolved_coingecko_ids: list[str] = []
+    invalid_coingecko_ids: list[str] = []
+
     evaluated_symbols: list[str] = []
     skipped_symbols: list[str] = []
+
+    evaluated_assets: list[str] = []
+    skipped_assets: list[str] = []
+
     skip_reasons: Dict[str, str] = {}
     debug_by_symbol: Dict[str, DebugSymbolInfo] = {}
 
     results: list[ScanResult]
-
-
-class ErrorResponse(BaseModel):
-    detail: str
 
 
 class ErrorResponse(BaseModel):

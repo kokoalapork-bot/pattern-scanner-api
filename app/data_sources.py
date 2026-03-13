@@ -30,6 +30,8 @@ TOKENIZED_STOCK_KEYWORDS = [
     "gold",
 ]
 
+DEMO_HISTORY_MAX_DAYS = 365
+
 
 class CoinGeckoConfigError(RuntimeError):
     pass
@@ -90,6 +92,12 @@ def build_coingecko_auth() -> CoinGeckoAuth:
     )
 
 
+def get_history_plan_limit_days(auth_mode: str) -> int | None:
+    if auth_mode == "demo":
+        return DEMO_HISTORY_MAX_DAYS
+    return None
+
+
 class CoinGeckoClient:
     def __init__(self) -> None:
         self.auth = build_coingecko_auth()
@@ -113,6 +121,17 @@ class CoinGeckoClient:
             "api_key_present": self.auth.api_key_present,
             "auth_header_name": self.auth.header_name,
         }
+
+    def normalize_history_days(self, requested_days: int | str) -> tuple[int, bool]:
+        try:
+            days_int = int(requested_days)
+        except Exception:
+            days_int = 365
+
+        plan_limit = get_history_plan_limit_days(self.auth.mode)
+        if plan_limit is not None and days_int > plan_limit:
+            return plan_limit, True
+        return days_int, False
 
     async def get_markets(
         self,
@@ -150,19 +169,31 @@ class CoinGeckoClient:
         interval: str = "daily",
     ) -> MarketDataFetchResult:
         if not coingecko_id:
+            normalized_days, capped = self.normalize_history_days(days)
             return MarketDataFetchResult(
                 ok=False,
                 reason="coingecko_id_missing",
                 endpoint="/coins/{id}/market_chart",
-                request_params={"vs_currency": vs_currency, "days": str(days), "interval": interval},
+                request_params={
+                    "vs_currency": vs_currency,
+                    "days": str(normalized_days),
+                    "interval": interval,
+                    "requested_days": str(days),
+                    "plan_limit_days": get_history_plan_limit_days(self.auth.mode),
+                    "days_capped_by_plan": capped,
+                },
                 **self.auth_debug(),
             )
 
+        normalized_days, capped = self.normalize_history_days(days)
         endpoint = f"/coins/{coingecko_id}/market_chart"
         request_params = {
             "vs_currency": vs_currency,
-            "days": str(days),
+            "days": str(normalized_days),
             "interval": interval,
+            "requested_days": str(days),
+            "plan_limit_days": get_history_plan_limit_days(self.auth.mode),
+            "days_capped_by_plan": capped,
         }
 
         retries = max(1, settings.history_retry_count)
@@ -171,7 +202,11 @@ class CoinGeckoClient:
 
         for attempt in range(retries):
             try:
-                resp = await self.client.get(endpoint, params=request_params)
+                resp = await self.client.get(endpoint, params={
+                    "vs_currency": vs_currency,
+                    "days": str(normalized_days),
+                    "interval": interval,
+                })
                 resp.raise_for_status()
                 payload = resp.json()
 
@@ -260,6 +295,19 @@ class CoinGeckoClient:
                     )
 
                 if status == 401:
+                    if self.auth.mode == "demo" and int(request_params["requested_days"]) > DEMO_HISTORY_MAX_DAYS:
+                        return MarketDataFetchResult(
+                            ok=False,
+                            reason="history_range_exceeds_plan_limit",
+                            error_message=(
+                                f"Demo plan requested {request_params['requested_days']} days, "
+                                f"plan limit is {DEMO_HISTORY_MAX_DAYS}. Original upstream error: {error_message}"
+                            ),
+                            endpoint="/coins/{id}/market_chart",
+                            http_status=status,
+                            request_params=request_params,
+                            **self.auth_debug(),
+                        )
                     return MarketDataFetchResult(
                         ok=False,
                         reason="history_http_401",

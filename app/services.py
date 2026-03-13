@@ -406,7 +406,7 @@ def resolve_requested_assets(
     unresolved_symbols: list[str] = []
 
     resolved_coingecko_ids: list[str] = []
-    invalid_coingecko_ids: list[str] = []
+    pending_coingecko_ids: list[str] = []
 
     skip_reasons: dict[str, str] = {}
     debug_by_symbol: dict[str, DebugSymbolInfo] = {}
@@ -414,7 +414,6 @@ def resolve_requested_assets(
     by_symbol = build_symbol_index(markets)
     by_id = build_id_index(markets)
 
-    # symbol path
     for sym in symbols or []:
         key = make_asset_key_from_symbol(sym)
         matches = by_symbol.get(sym.lower(), [])
@@ -448,7 +447,6 @@ def resolve_requested_assets(
                 reason="unresolved_symbol",
             )
 
-    # direct coingecko_id path
     for cid in coingecko_ids or []:
         cid_norm = cid.lower()
         key = make_asset_key_from_id(cid_norm)
@@ -469,46 +467,37 @@ def resolve_requested_assets(
                 reason=None,
             )
         else:
-            # Do not fake unresolved_symbol here.
-            invalid_coingecko_ids.append(cid_norm)
-            skip_reasons[key] = "invalid_coingecko_id"
+            # IMPORTANT:
+            # Do NOT mark as invalid here just because it is absent from markets pages.
+            # It may be a valid CoinGecko id outside the currently fetched markets universe.
+            pending_coingecko_ids.append(cid_norm)
             debug_by_symbol[key] = DebugSymbolInfo(
                 input_symbol=None,
                 input_coingecko_id=cid_norm,
                 source_type="coingecko_id",
-                resolved=False,
+                resolved=True,
                 coingecko_id=cid_norm,
-                status="invalid",
+                status="pending_lookup",
                 stage="resolve_coingecko_id",
-                reason="invalid_coingecko_id",
+                reason=None,
             )
 
     resolved_candidates = dedupe_candidates_by_id(resolved_candidates)
 
     return (
         resolved_candidates,
+        pending_coingecko_ids,
         resolved_symbols,
         unresolved_symbols,
         resolved_coingecko_ids,
-        invalid_coingecko_ids,
         skip_reasons,
         debug_by_symbol,
     )
 
 
 def build_asset_sources(
-    symbols: Optional[list[str]],
-    coingecko_ids: Optional[list[str]],
     debug_by_symbol: dict[str, DebugSymbolInfo],
 ) -> dict[str, dict]:
-    """
-    Returns:
-      coingecko_id -> {
-        "source_type": "symbol" | "coingecko_id" | "mixed",
-        "input_symbol": ...,
-        "input_coingecko_id": ...
-      }
-    """
     mapping: dict[str, dict] = {}
 
     for _, debug in debug_by_symbol.items():
@@ -535,6 +524,17 @@ def build_asset_sources(
             slot["input_coingecko_id"] = debug.input_coingecko_id
 
     return mapping
+
+
+def merge_coin_candidates(existing: list[dict], new_coin: dict) -> list[dict]:
+    coin_id = str(new_coin.get("id", "")).lower()
+    if not coin_id:
+        return existing
+
+    seen = {str(c.get("id", "")).lower() for c in existing}
+    if coin_id in seen:
+        return existing
+    return existing + [new_coin]
 
 
 def mark_skipped(
@@ -674,10 +674,10 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
         (
             candidates,
+            pending_coingecko_ids,
             resolved_symbols,
             unresolved_symbols,
             resolved_coingecko_ids,
-            invalid_coingecko_ids,
             skip_reasons,
             debug_by_symbol,
         ) = resolve_requested_assets(
@@ -686,20 +686,81 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             coingecko_ids=req.coingecko_ids,
         )
 
-        asset_sources = build_asset_sources(
-            symbols=req.symbols,
-            coingecko_ids=req.coingecko_ids,
-            debug_by_symbol=debug_by_symbol,
-        )
+        # Direct lookup fallback for ids missing from top markets pages.
+        invalid_coingecko_ids: list[str] = []
+        for cid in pending_coingecko_ids:
+            asset_key = make_asset_key_from_id(cid)
+            snapshot = await client.fetch_coin_snapshot_safe(cid, vs_currency=req.vs_currency)
 
-        # broad market mode fallback
+            if not snapshot.ok:
+                reason = snapshot.reason or "invalid_coingecko_id"
+                if reason == "history_http_404":
+                    reason = "invalid_coingecko_id"
+                if reason == "invalid_coingecko_id":
+                    invalid_coingecko_ids.append(cid)
+
+                existing = debug_by_symbol.get(asset_key, DebugSymbolInfo(
+                    input_symbol=None,
+                    input_coingecko_id=cid,
+                    source_type="coingecko_id",
+                ))
+                debug_by_symbol[asset_key] = DebugSymbolInfo(
+                    input_symbol=existing.input_symbol,
+                    input_coingecko_id=existing.input_coingecko_id,
+                    source_type=existing.source_type,
+                    resolved=False,
+                    coingecko_id=cid,
+                    status="invalid",
+                    stage="resolve_coingecko_id",
+                    reason=reason,
+                    endpoint=snapshot.endpoint,
+                    http_status=snapshot.http_status,
+                    request_params=snapshot.request_params,
+                    error_message=snapshot.error_message,
+                    auth_mode=snapshot.auth_mode,
+                    base_url=snapshot.base_url,
+                    api_key_present=snapshot.api_key_present,
+                    auth_header_name=snapshot.auth_header_name,
+                )
+                skip_reasons[asset_key] = reason
+                continue
+
+            coin = snapshot.coin or {}
+            candidates = merge_coin_candidates(candidates, coin)
+            resolved_coingecko_ids.append(cid)
+
+            existing = debug_by_symbol.get(asset_key, DebugSymbolInfo(
+                input_symbol=None,
+                input_coingecko_id=cid,
+                source_type="coingecko_id",
+            ))
+            debug_by_symbol[asset_key] = DebugSymbolInfo(
+                input_symbol=existing.input_symbol,
+                input_coingecko_id=existing.input_coingecko_id,
+                source_type=existing.source_type,
+                resolved=True,
+                coingecko_id=str(coin.get("id") or cid),
+                status="resolved",
+                stage="resolve_coingecko_id",
+                reason=None,
+                endpoint=snapshot.endpoint,
+                http_status=snapshot.http_status,
+                request_params=snapshot.request_params,
+                error_message=None,
+                auth_mode=snapshot.auth_mode,
+                base_url=snapshot.base_url,
+                api_key_present=snapshot.api_key_present,
+                auth_header_name=snapshot.auth_header_name,
+            )
+
+        asset_sources = build_asset_sources(debug_by_symbol=debug_by_symbol)
+
         if not (req.symbols or req.coingecko_ids):
             candidates = []
             excluded_symbols = {s.lower() for s in req.exclude_symbols or []}
 
             for coin in markets:
                 symbol = str(coin.get("symbol", "")).upper()
-                name = str(coin.get("name", ""))
                 coin_id = str(coin.get("id", ""))
 
                 if str(coin.get("symbol", "")).lower() in excluded_symbols:
@@ -741,6 +802,8 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 if len(candidates) >= req.max_coins_to_evaluate:
                     break
 
+        candidates = dedupe_candidates_by_id(candidates)
+
         evaluated_symbols: list[str] = []
         skipped_symbols: list[str] = []
 
@@ -758,7 +821,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 coin_id.lower(),
                 {
                     "source_type": "coingecko_id",
-                    "input_symbol": symbol,
+                    "input_symbol": symbol or None,
                     "input_coingecko_id": coin_id,
                 },
             )
@@ -837,6 +900,10 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 reason = fetch.reason or "history_fetch_failed"
                 if reason == "history_http_404":
                     reason = "invalid_coingecko_id"
+
+                if reason == "invalid_coingecko_id" and source_meta.get("source_type") == "coingecko_id":
+                    if coin_id.lower() not in invalid_coingecko_ids:
+                        invalid_coingecko_ids.append(coin_id.lower())
 
                 mark_skipped(
                     asset_key=asset_key,
@@ -1096,7 +1163,8 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 continue
 
             evaluated_assets.append(asset_key)
-            evaluated_symbols.append(symbol)
+            if symbol:
+                evaluated_symbols.append(symbol)
 
             debug_by_symbol[asset_key] = DebugSymbolInfo(
                 input_symbol=source_meta.get("input_symbol"),
@@ -1158,11 +1226,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             results.append(
                 ScanResult(
                     coingecko_id=coin_id,
-                    symbol=symbol,
-                    name=name,
+                    symbol=symbol or coin_id.upper(),
+                    name=name or coin_id,
                     age_days=asset_age_days,
-                    market_cap_usd=float(coin.get("market_cap") or 0),
-                    volume_24h_usd=float(coin.get("total_volume") or 0),
+                    market_cap_usd=float(coin.get("market_cap") or 0) if coin.get("market_cap") is not None else None,
+                    volume_24h_usd=float(coin.get("total_volume") or 0) if coin.get("total_volume") is not None else None,
                     similarity=float(best["similarity"]),
                     raw_similarity=float(best["raw_similarity"]),
                     label=final_label,
@@ -1215,8 +1283,8 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             returned_count=len(final_results),
             resolved_symbols=resolved_symbols,
             unresolved_symbols=unresolved_symbols,
-            resolved_coingecko_ids=resolved_coingecko_ids,
-            invalid_coingecko_ids=invalid_coingecko_ids,
+            resolved_coingecko_ids=sorted(set(resolved_coingecko_ids)),
+            invalid_coingecko_ids=sorted(set(invalid_coingecko_ids)),
             evaluated_symbols=evaluated_symbols,
             skipped_symbols=skipped_symbols,
             evaluated_assets=evaluated_assets,

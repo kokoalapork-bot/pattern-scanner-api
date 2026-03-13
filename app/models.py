@@ -1,4 +1,4 @@
-from typing import Literal, Optional, Dict, List
+from typing import Literal, Optional, Dict
 from pydantic import BaseModel, Field
 
 PatternName = Literal["crown_shelf_right_spike"]
@@ -36,6 +36,14 @@ class BestWindow(BaseModel):
     candidate_windows_count: int
 
 
+class DebugSymbolInfo(BaseModel):
+    resolved: bool = False
+    coingecko_id: str | None = None
+    status: str = "unknown"
+    stage: str = "unknown"
+    reason: str | None = None
+
+
 class ScanResult(BaseModel):
     coingecko_id: str
     symbol: str
@@ -67,6 +75,7 @@ class ScanResponse(BaseModel):
     evaluated_symbols: list[str] = []
     skipped_symbols: list[str] = []
     skip_reasons: Dict[str, str] = {}
+    debug_by_symbol: Dict[str, DebugSymbolInfo] = {}
 
     results: list[ScanResult]
 

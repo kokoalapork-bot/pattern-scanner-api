@@ -1,3 +1,5 @@
+# models.py
+
 from typing import Literal, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
@@ -46,6 +48,9 @@ class DebugSymbolInfo(BaseModel):
     http_status: int | None = None
     request_params: Dict[str, Any] | None = None
     error_message: str | None = None
+    auth_mode: str | None = None
+    base_url: str | None = None
+    api_key_present: bool | None = None
 
 
 class ScanResult(BaseModel):

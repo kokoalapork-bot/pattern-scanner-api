@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Dict
+import asyncio
 
 import httpx
 
@@ -38,6 +39,9 @@ class MarketDataFetchResult:
     reason: str | None = None
     chart: dict[str, Any] | None = None
     error_message: str | None = None
+    endpoint: str | None = None
+    http_status: int | None = None
+    request_params: Dict[str, Any] | None = None
 
 
 class CoinGeckoClient:
@@ -77,48 +81,150 @@ class CoinGeckoClient:
 
         return items
 
-    async def get_market_chart(self, coin_id: str, vs_currency: str = "usd", days: int = 450) -> dict[str, Any]:
-        resp = await self.client.get(
-            f"/coins/{coin_id}/market_chart",
-            params={
-                "vs_currency": vs_currency,
-                "days": str(days),
-                "interval": "daily",
-            },
-        )
+    async def get_market_chart(self, coin_id: str, vs_currency: str = "usd", days: int | str = 450) -> dict[str, Any]:
+        endpoint = f"/coins/{coin_id}/market_chart"
+        params = {
+            "vs_currency": vs_currency,
+            "days": str(days),
+            "interval": "daily",
+        }
+        resp = await self.client.get(endpoint, params=params)
         resp.raise_for_status()
         return resp.json()
 
-    async def fetch_market_chart_safe(self, coin_id: str, vs_currency: str = "usd", days: int = 450) -> MarketDataFetchResult:
+    async def fetch_market_chart_safe(self, coin_id: str, vs_currency: str = "usd", days: int | str = 450) -> MarketDataFetchResult:
+        """
+        Fetch history by coingecko_id only.
+        Adds retry/backoff for 429 and returns structured debug info.
+        """
         if not coin_id:
-            return MarketDataFetchResult(ok=False, reason="coingecko_id_missing")
+            return MarketDataFetchResult(
+                ok=False,
+                reason="coingecko_id_missing",
+                endpoint="/coins/{id}/market_chart",
+                request_params={"vs_currency": vs_currency, "days": str(days), "interval": "daily"},
+            )
 
-        try:
-            chart = await self.get_market_chart(coin_id=coin_id, vs_currency=vs_currency, days=days)
-        except httpx.HTTPStatusError as e:
-            code = e.response.status_code
-            if code == 429:
-                return MarketDataFetchResult(ok=False, reason="rate_limited", error_message=str(e))
-            if code == 404:
-                return MarketDataFetchResult(ok=False, reason="history_fetch_failed", error_message=str(e))
-            return MarketDataFetchResult(ok=False, reason="history_fetch_failed", error_message=str(e))
-        except httpx.RequestError as e:
-            return MarketDataFetchResult(ok=False, reason="network_error", error_message=str(e))
-        except Exception as e:
-            return MarketDataFetchResult(ok=False, reason="market_data_fetch_failed", error_message=f"{type(e).__name__}: {e}")
+        endpoint = f"/coins/{coin_id}/market_chart"
+        params = {
+            "vs_currency": vs_currency,
+            "days": str(days),
+            "interval": "daily",
+        }
+
+        # retry/backoff only for 429
+        retries = 3
+        backoffs = [0.8, 1.6, 3.2]
+
+        for attempt in range(retries):
+            try:
+                resp = await self.client.get(endpoint, params=params)
+                resp.raise_for_status()
+                chart = resp.json()
+                break
+            except httpx.HTTPStatusError as e:
+                code = e.response.status_code
+
+                if code == 429:
+                    if attempt < retries - 1:
+                        await asyncio.sleep(backoffs[attempt])
+                        continue
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="rate_limited",
+                        error_message=str(e),
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=code,
+                        request_params=params,
+                    )
+
+                if code == 404:
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_not_found",
+                        error_message=str(e),
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=code,
+                        request_params=params,
+                    )
+
+                return MarketDataFetchResult(
+                    ok=False,
+                    reason="history_http_error",
+                    error_message=str(e),
+                    endpoint="/coins/{id}/market_chart",
+                    http_status=code,
+                    request_params=params,
+                )
+
+            except httpx.RequestError as e:
+                return MarketDataFetchResult(
+                    ok=False,
+                    reason="network_error",
+                    error_message=str(e),
+                    endpoint="/coins/{id}/market_chart",
+                    request_params=params,
+                )
+            except Exception as e:
+                return MarketDataFetchResult(
+                    ok=False,
+                    reason="history_fetch_failed",
+                    error_message=f"{type(e).__name__}: {e}",
+                    endpoint="/coins/{id}/market_chart",
+                    request_params=params,
+                )
+        else:
+            return MarketDataFetchResult(
+                ok=False,
+                reason="history_fetch_failed",
+                error_message="retry loop exhausted unexpectedly",
+                endpoint="/coins/{id}/market_chart",
+                request_params=params,
+            )
 
         if not isinstance(chart, dict):
-            return MarketDataFetchResult(ok=False, reason="bad_response_schema", error_message="chart is not dict")
+            return MarketDataFetchResult(
+                ok=False,
+                reason="history_bad_response_schema",
+                error_message="chart is not a dict",
+                endpoint="/coins/{id}/market_chart",
+                request_params=params,
+            )
 
         prices = chart.get("prices")
         if prices is None:
-            return MarketDataFetchResult(ok=False, reason="bad_response_schema", error_message="missing prices")
-        if not isinstance(prices, list):
-            return MarketDataFetchResult(ok=False, reason="bad_response_schema", error_message="prices is not list")
-        if len(prices) == 0:
-            return MarketDataFetchResult(ok=False, reason="empty_history", error_message="empty prices")
+            return MarketDataFetchResult(
+                ok=False,
+                reason="history_bad_response_schema",
+                error_message="missing 'prices' field",
+                endpoint="/coins/{id}/market_chart",
+                request_params=params,
+            )
 
-        return MarketDataFetchResult(ok=True, chart=chart)
+        if not isinstance(prices, list):
+            return MarketDataFetchResult(
+                ok=False,
+                reason="history_bad_response_schema",
+                error_message="'prices' is not a list",
+                endpoint="/coins/{id}/market_chart",
+                request_params=params,
+            )
+
+        if len(prices) == 0:
+            return MarketDataFetchResult(
+                ok=False,
+                reason="history_empty",
+                error_message="prices list is empty",
+                endpoint="/coins/{id}/market_chart",
+                request_params=params,
+            )
+
+        return MarketDataFetchResult(
+            ok=True,
+            chart=chart,
+            endpoint="/coins/{id}/market_chart",
+            request_params=params,
+        )
 
 
 def looks_like_stable(symbol: str, name: str) -> bool:

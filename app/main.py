@@ -20,6 +20,7 @@ class RootResponse(BaseModel):
     message: str
     docs: str
     health: str
+    openapi: str
     default_min_age_days: int
     default_max_age_days: int
 
@@ -27,7 +28,10 @@ class RootResponse(BaseModel):
 app = FastAPI(
     title="Crypto Pattern Scanner API",
     version="1.0.0",
-    description="Scans recently listed crypto assets and ranks them by similarity to the crown-shelf-right-spike daily-chart silhouette.",
+    description=(
+        "Scans crypto assets for the crown-shelf-right-spike base structure. "
+        "Supports both symbol-based resolution and direct CoinGecko ids."
+    ),
     servers=[{"url": BASE_URL}],
 )
 
@@ -50,12 +54,19 @@ async def health() -> HealthResponse:
     "/scan",
     response_model=ScanResponse,
     responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Scan assets by symbols and/or coingecko_ids",
 )
 async def scan(req: ScanRequest):
     if req.top_k > req.max_coins_to_evaluate:
         return JSONResponse(
             status_code=400,
             content={"detail": "top_k cannot be greater than max_coins_to_evaluate"},
+        )
+
+    if not req.symbols and not req.coingecko_ids and req.max_coins_to_evaluate < 1:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Provide symbols, coingecko_ids, or a positive max_coins_to_evaluate"},
         )
 
     return await scan_pattern(req)
@@ -67,6 +78,7 @@ async def root() -> RootResponse:
         message="Crypto Pattern Scanner API",
         docs="/docs",
         health="/health",
+        openapi="/openapi.json",
         default_min_age_days=settings.default_min_age_days,
         default_max_age_days=settings.default_max_age_days,
     )

@@ -1,7 +1,6 @@
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
-
 PatternName = Literal["crown_shelf_right_spike"]
 
 
@@ -10,10 +9,17 @@ class ScanRequest(BaseModel):
     min_age_days: int = Field(default=14, ge=1, le=5000)
     max_age_days: int = Field(default=450, ge=1, le=5000)
     top_k: int = Field(default=20, ge=1, le=100)
-    max_coins_to_evaluate: int = Field(default=250, ge=10, le=2000)
+    max_coins_to_evaluate: int = Field(default=80, ge=1, le=500)
     vs_currency: str = Field(default="usd")
     include_notes: bool = True
+    debug: bool = False
+
+    # Поиск по тикерам
     symbols: Optional[list[str]] = None
+
+    # Поиск по CoinGecko IDs
+    coingecko_ids: Optional[list[str]] = None
+
     exclude_symbols: Optional[list[str]] = None
 
 
@@ -27,6 +33,12 @@ class MatchBreakdown(BaseModel):
     template_shape: float
 
 
+class BestWindow(BaseModel):
+    start_idx: int
+    end_idx: int
+    length_days: int
+
+
 class ScanResult(BaseModel):
     coingecko_id: str
     symbol: str
@@ -34,16 +46,30 @@ class ScanResult(BaseModel):
     age_days: int
     market_cap_usd: float | None = None
     volume_24h_usd: float | None = None
+
     similarity: float
+    raw_similarity: float
+    label: str
+    stage: str
+
     breakdown: MatchBreakdown
+    best_window: BestWindow
+
     notes: list[str] = []
     source: str = "coingecko"
 
 
 class ScanResponse(BaseModel):
     pattern_name: PatternName
+
     evaluated_count: int
     returned_count: int
+
+    resolved_symbols: list[str] = []
+    unresolved_symbols: list[str] = []
+    evaluated_symbols: list[str] = []
+    skipped_symbols: list[str] = []
+
     results: list[ScanResult]
 
 

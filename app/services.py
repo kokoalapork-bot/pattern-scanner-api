@@ -13,6 +13,7 @@ from .data_sources import (
 )
 from .models import (
     BestWindow,
+    DebugSymbolInfo,
     MatchBreakdown,
     ScanRequest,
     ScanResponse,
@@ -56,25 +57,18 @@ def iter_windows(closes: list[float], min_age_days: int, max_age_days: int):
 
         step = max(3, w // 8)
         yielded_last = False
-        count = 0
 
         for end in range(w, n + 1, step):
             start = end - w
-            count += 1
             yield closes[start:end], w, start, end, n
             if end == n:
                 yielded_last = True
 
         if not yielded_last:
-            count += 1
             yield closes[n - w:n], w, n - w, n, n
 
 
 def position_bonus(start_idx: int, end_idx: int, total_len: int) -> float:
-    """
-    Ищем окно ближе к середине / правой части паттерна,
-    но не в самом хвосте графика.
-    """
     if total_len <= 0:
         return 0.0
 
@@ -114,10 +108,7 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
     ):
         candidate_windows_count += 1
 
-        try:
-            result = score_crown_shelf_right_spike(window_closes)
-        except Exception:
-            continue
+        result = score_crown_shelf_right_spike(window_closes)
 
         pos = position_bonus(start_idx, end_idx, total_len)
         raw_similarity = float(result.similarity)
@@ -158,11 +149,12 @@ def resolve_requested_coins(
     markets: list[dict],
     symbols: Optional[list[str]],
     coingecko_ids: Optional[list[str]],
-) -> tuple[list[dict], list[str], list[str], dict[str, str]]:
+) -> tuple[list[dict], list[str], list[str], dict[str, str], dict[str, DebugSymbolInfo]]:
     resolved: list[dict] = []
     resolved_symbols: list[str] = []
     unresolved_symbols: list[str] = []
     skip_reasons: dict[str, str] = {}
+    debug_by_symbol: dict[str, DebugSymbolInfo] = {}
 
     by_id = {str(c.get("id")): c for c in markets}
     by_symbol = build_symbol_index(markets)
@@ -171,12 +163,27 @@ def resolve_requested_coins(
         for cid in coingecko_ids:
             coin = by_id.get(cid)
             if coin:
+                sym = str(coin.get("symbol", "")).upper()
                 resolved.append(coin)
-                resolved_symbols.append(str(coin.get("symbol", "")).upper())
+                resolved_symbols.append(sym)
+                debug_by_symbol[sym] = DebugSymbolInfo(
+                    resolved=True,
+                    coingecko_id=str(coin.get("id")),
+                    status="resolved",
+                    stage="resolve_symbol",
+                    reason=None,
+                )
             else:
                 unresolved_symbols.append(cid)
                 skip_reasons[cid] = "unresolved_symbol"
-        return resolved, resolved_symbols, unresolved_symbols, skip_reasons
+                debug_by_symbol[cid] = DebugSymbolInfo(
+                    resolved=False,
+                    coingecko_id=None,
+                    status="skipped",
+                    stage="resolve_symbol",
+                    reason="unresolved_symbol",
+                )
+        return resolved, resolved_symbols, unresolved_symbols, skip_reasons, debug_by_symbol
 
     if symbols:
         for sym in symbols:
@@ -190,17 +197,46 @@ def resolve_requested_coins(
                 )[0]
                 resolved.append(chosen)
                 resolved_symbols.append(sym.upper())
+                debug_by_symbol[sym.upper()] = DebugSymbolInfo(
+                    resolved=True,
+                    coingecko_id=str(chosen.get("id")),
+                    status="resolved",
+                    stage="resolve_symbol",
+                    reason=None,
+                )
             else:
                 unresolved_symbols.append(sym.upper())
                 skip_reasons[sym.upper()] = "unresolved_symbol"
+                debug_by_symbol[sym.upper()] = DebugSymbolInfo(
+                    resolved=False,
+                    coingecko_id=None,
+                    status="skipped",
+                    stage="resolve_symbol",
+                    reason="unresolved_symbol",
+                )
 
-    return resolved, resolved_symbols, unresolved_symbols, skip_reasons
+    return resolved, resolved_symbols, unresolved_symbols, skip_reasons, debug_by_symbol
 
 
-def mark_skipped(symbol: str, reason: str, skipped_symbols: list[str], skip_reasons: dict[str, str]):
+def mark_skipped(
+    symbol: str,
+    coingecko_id: str | None,
+    reason: str,
+    stage: str,
+    skipped_symbols: list[str],
+    skip_reasons: dict[str, str],
+    debug_by_symbol: dict[str, DebugSymbolInfo],
+):
     if symbol not in skipped_symbols:
         skipped_symbols.append(symbol)
     skip_reasons[symbol] = reason
+    debug_by_symbol[symbol] = DebugSymbolInfo(
+        resolved=True,
+        coingecko_id=coingecko_id,
+        status="skipped",
+        stage=stage,
+        reason=reason,
+    )
 
 
 async def scan_pattern(req: ScanRequest) -> ScanResponse:
@@ -230,23 +266,26 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         evaluated_symbols: list[str] = []
         skipped_symbols: list[str] = []
         skip_reasons: dict[str, str] = {}
+        debug_by_symbol: dict[str, DebugSymbolInfo] = {}
 
         if explicit_mode:
-            candidates, resolved_symbols, unresolved_symbols, initial_skip_reasons = resolve_requested_coins(
+            candidates, resolved_symbols, unresolved_symbols, initial_skip_reasons, initial_debug = resolve_requested_coins(
                 markets=markets,
                 symbols=req.symbols,
                 coingecko_ids=req.coingecko_ids,
             )
             skip_reasons.update(initial_skip_reasons)
+            debug_by_symbol.update(initial_debug)
         else:
             candidates = []
             excluded_symbols = {s.lower() for s in req.exclude_symbols or []}
 
             for coin in markets:
-                symbol = str(coin.get("symbol", "")).lower()
+                symbol = str(coin.get("symbol", "")).upper()
                 name = str(coin.get("name", ""))
+                coin_id = str(coin.get("id", ""))
 
-                if symbol in excluded_symbols:
+                if str(coin.get("symbol", "")).lower() in excluded_symbols:
                     continue
 
                 market_cap = float(coin.get("market_cap") or 0)
@@ -255,67 +294,124 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 if market_cap < settings.min_market_cap_usd or volume_24h < settings.min_24h_volume_usd:
                     continue
 
-                if settings.exclude_stables and looks_like_stable(symbol, name):
+                if settings.exclude_stables and looks_like_stable(str(coin.get("symbol", "")), name):
                     continue
 
                 if settings.exclude_tokenized_stocks and looks_like_tokenized_stock(name):
                     continue
 
                 candidates.append(coin)
+                debug_by_symbol[symbol] = DebugSymbolInfo(
+                    resolved=True,
+                    coingecko_id=coin_id,
+                    status="candidate",
+                    stage="resolve_symbol",
+                    reason=None,
+                )
+
                 if len(candidates) >= req.max_coins_to_evaluate:
                     break
 
         results: list[ScanResult] = []
 
         for coin in candidates:
-            coin_id = str(coin["id"])
-            symbol = str(coin["symbol"]).upper()
-            name = str(coin["name"])
+            coin_id = str(coin.get("id", ""))
+            symbol = str(coin.get("symbol", "")).upper()
+            name = str(coin.get("name", ""))
 
-            try:
-                chart = await client.get_market_chart(
-                    coin_id,
-                    vs_currency=req.vs_currency,
-                    days=min(450, req.max_age_days if not explicit_mode else 450),
+            if not coin_id:
+                mark_skipped(
+                    symbol, None, "coingecko_id_missing", "fetch_market_data",
+                    skipped_symbols, skip_reasons, debug_by_symbol
                 )
-            except httpx.HTTPStatusError:
-                mark_skipped(symbol, "market_data_fetch_failed", skipped_symbols, skip_reasons)
-                continue
-            except httpx.HTTPError:
-                mark_skipped(symbol, "market_data_fetch_failed", skipped_symbols, skip_reasons)
-                continue
-            except Exception:
-                mark_skipped(symbol, "market_data_fetch_failed", skipped_symbols, skip_reasons)
                 continue
 
+            debug_by_symbol[symbol] = DebugSymbolInfo(
+                resolved=True,
+                coingecko_id=coin_id,
+                status="fetching",
+                stage="fetch_market_data",
+                reason=None,
+            )
+
+            fetch = await client.fetch_market_chart_safe(
+                coin_id=coin_id,
+                vs_currency=req.vs_currency,
+                days=min(450, req.max_age_days if not explicit_mode else 450),
+            )
+
+            if not fetch.ok:
+                mark_skipped(
+                    symbol, coin_id, fetch.reason or "market_data_fetch_failed", "fetch_market_data",
+                    skipped_symbols, skip_reasons, debug_by_symbol
+                )
+                continue
+
+            chart = fetch.chart
             closes = coingecko_daily_closes(chart)
+            if len(closes) == 0:
+                mark_skipped(
+                    symbol, coin_id, "empty_history", "fetch_market_data",
+                    skipped_symbols, skip_reasons, debug_by_symbol
+                )
+                continue
+
             if len(closes) < 30:
-                mark_skipped(symbol, "insufficient_history", skipped_symbols, skip_reasons)
+                mark_skipped(
+                    symbol, coin_id, "insufficient_history", "fetch_market_data",
+                    skipped_symbols, skip_reasons, debug_by_symbol
+                )
                 continue
 
             asset_age_days = age_from_chart_days(chart)
             if asset_age_days is None:
-                mark_skipped(symbol, "insufficient_history", skipped_symbols, skip_reasons)
+                mark_skipped(
+                    symbol, coin_id, "bad_response_schema", "fetch_market_data",
+                    skipped_symbols, skip_reasons, debug_by_symbol
+                )
                 continue
 
-            # Для broad market scan фильтр возраста актива сохраняем.
-            # Для explicit_mode не режем актив до поиска лучшего окна.
             if not explicit_mode:
                 if asset_age_days < req.min_age_days or asset_age_days > req.max_age_days:
-                    mark_skipped(symbol, "filtered_before_scoring", skipped_symbols, skip_reasons)
+                    mark_skipped(
+                        symbol, coin_id, "filtered_before_scoring", "filter_result",
+                        skipped_symbols, skip_reasons, debug_by_symbol
+                    )
                     continue
+
+            debug_by_symbol[symbol] = DebugSymbolInfo(
+                resolved=True,
+                coingecko_id=coin_id,
+                status="building_windows",
+                stage="build_windows",
+                reason=None,
+            )
 
             try:
                 best = find_best_window(closes, req.min_age_days, req.max_age_days)
             except Exception:
-                mark_skipped(symbol, "window_generation_failed", skipped_symbols, skip_reasons)
+                mark_skipped(
+                    symbol, coin_id, "window_generation_failed", "build_windows",
+                    skipped_symbols, skip_reasons, debug_by_symbol
+                )
                 continue
 
             if best is None:
-                mark_skipped(symbol, "no_valid_windows", skipped_symbols, skip_reasons)
+                mark_skipped(
+                    symbol, coin_id, "no_valid_windows", "build_windows",
+                    skipped_symbols, skip_reasons, debug_by_symbol
+                )
                 continue
 
             evaluated_symbols.append(symbol)
+
+            debug_by_symbol[symbol] = DebugSymbolInfo(
+                resolved=True,
+                coingecko_id=coin_id,
+                status="evaluated",
+                stage="score_windows",
+                reason=None,
+            )
 
             notes = list(best["notes"])
             if req.include_notes:
@@ -349,9 +445,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             )
 
         results.sort(key=lambda x: x.similarity, reverse=True)
-
-        # Никакого жесткого threshold здесь нет:
-        # top-k лучших всегда возвращаются.
         final_results = results[: req.top_k]
 
         return ScanResponse(
@@ -363,6 +456,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             evaluated_symbols=evaluated_symbols,
             skipped_symbols=skipped_symbols,
             skip_reasons=skip_reasons,
+            debug_by_symbol=debug_by_symbol,
             results=final_results,
         )
     finally:

@@ -90,13 +90,12 @@ class PatternResult:
 
 class CrownShelfRightSpikeScorer:
     """
-    Паттерн:
-    crown -> shelf -> right_spike -> reversion
+    crown -> shelf -> right spike -> reversion to shelf
 
-    Сделан мягче:
-    - crown не бинарная
-    - partial matches сохраняются
-    - SIREN / RIVER должны проходить как минимум как partial/structural
+    Цели:
+    - мягкий crown detector
+    - partial matches не пропадают
+    - SIREN / RIVER не должны валиться в crown=0 почти всегда
     """
 
     def __init__(self, debug: bool = False):
@@ -107,10 +106,10 @@ class CrownShelfRightSpikeScorer:
         xs = _smooth(xs, 5)
         xs = _minmax_scale(xs)
 
-        crown_zone = xs[:42]       # 0–35%
-        shelf_zone = xs[42:90]     # 35–75%
-        spike_zone = xs[90:108]    # 75–90%
-        revert_zone = xs[108:]     # 90–100%
+        crown_zone = xs[:42]       # 0-35%
+        shelf_zone = xs[42:90]     # 35-75%
+        spike_zone = xs[90:108]    # 75-90%
+        revert_zone = xs[108:]     # 90-100%
 
         crown_score, crown_notes = self._score_crown(crown_zone)
         drop_score, drop_notes = self._score_drop(crown_zone, shelf_zone)
@@ -222,7 +221,6 @@ class CrownShelfRightSpikeScorer:
 
         flatness = max(0.0, 1.0 - min(1.0, vol / 0.09))
         levelness = max(0.0, 1.0 - min(1.0, slope / 0.12))
-
         score = 0.65 * flatness + 0.35 * levelness
 
         if score >= 0.70:
@@ -239,7 +237,6 @@ class CrownShelfRightSpikeScorer:
         spike_gain = max(0.0, spike_top - shelf_mid)
         spike_narrowness = max(0.0, 1.0 - min(1.0, _stdev(spike_zone) / 0.18))
         raw_height = max(0.0, min(1.0, spike_gain / 0.30))
-
         score = 0.75 * raw_height + 0.25 * spike_narrowness
 
         if score >= 0.75:
@@ -280,7 +277,6 @@ class CrownShelfRightSpikeScorer:
             return 0.0, ["Асимметрию формы не удалось оценить."]
         left_height = max(crown_zone) - min(crown_zone)
         right_height = max(spike_zone) - min(spike_zone)
-
         ratio = right_height / max(1e-9, left_height)
         score = 1.0 - min(1.0, abs(ratio - 1.0) / 1.5)
 
@@ -349,7 +345,6 @@ class CrownShelfRightSpikeScorer:
         return "active", notes
 
 
-def score_crown_shelf_right_spike(close: Iterable[float]):
+def score_crown_shelf_right_spike(close: Iterable[float]) -> PatternResult:
     scorer = CrownShelfRightSpikeScorer(debug=False)
-    result = scorer.score(list(close))
-    return result
+    return scorer.score(list(close))

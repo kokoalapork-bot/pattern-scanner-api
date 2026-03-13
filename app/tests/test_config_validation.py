@@ -1,10 +1,11 @@
 import importlib
 import os
+import sys
 
 import pytest
 
 
-def _reload_config(monkeypatch, **env):
+def reload_config_with_env(monkeypatch, **env):
     for key in [
         "COINGECKO_AUTH_MODE",
         "COINGECKO_API_KEY",
@@ -12,16 +13,20 @@ def _reload_config(monkeypatch, **env):
     ]:
         monkeypatch.delenv(key, raising=False)
 
-    for k, v in env.items():
-        monkeypatch.setenv(k, v)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
 
-    import app.config as config
-    importlib.reload(config)
-    return config
+    if "app.config" in sys.modules:
+        importlib.reload(sys.modules["app.config"])
+        return sys.modules["app.config"]
+
+    import app.config
+    importlib.reload(app.config)
+    return app.config
 
 
 def test_demo_config_valid(monkeypatch):
-    config = _reload_config(
+    config = reload_config_with_env(
         monkeypatch,
         COINGECKO_AUTH_MODE="demo",
         COINGECKO_API_KEY="demo-key",
@@ -32,7 +37,7 @@ def test_demo_config_valid(monkeypatch):
 
 
 def test_pro_config_valid(monkeypatch):
-    config = _reload_config(
+    config = reload_config_with_env(
         monkeypatch,
         COINGECKO_AUTH_MODE="pro",
         COINGECKO_API_KEY="pro-key",
@@ -44,7 +49,7 @@ def test_pro_config_valid(monkeypatch):
 
 def test_demo_cannot_use_pro_base(monkeypatch):
     with pytest.raises(Exception):
-        _reload_config(
+        reload_config_with_env(
             monkeypatch,
             COINGECKO_AUTH_MODE="demo",
             COINGECKO_API_KEY="demo-key",
@@ -54,7 +59,7 @@ def test_demo_cannot_use_pro_base(monkeypatch):
 
 def test_pro_cannot_use_public_base(monkeypatch):
     with pytest.raises(Exception):
-        _reload_config(
+        reload_config_with_env(
             monkeypatch,
             COINGECKO_AUTH_MODE="pro",
             COINGECKO_API_KEY="pro-key",
@@ -64,7 +69,7 @@ def test_pro_cannot_use_public_base(monkeypatch):
 
 def test_missing_key_fails(monkeypatch):
     with pytest.raises(Exception):
-        _reload_config(
+        reload_config_with_env(
             monkeypatch,
             COINGECKO_AUTH_MODE="demo",
             COINGECKO_API_KEY="",
@@ -74,7 +79,7 @@ def test_missing_key_fails(monkeypatch):
 
 def test_whitespace_key_fails(monkeypatch):
     with pytest.raises(Exception):
-        _reload_config(
+        reload_config_with_env(
             monkeypatch,
             COINGECKO_AUTH_MODE="demo",
             COINGECKO_API_KEY="   ",

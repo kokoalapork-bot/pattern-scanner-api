@@ -467,9 +467,6 @@ def resolve_requested_assets(
                 reason=None,
             )
         else:
-            # IMPORTANT:
-            # Do NOT mark as invalid here just because it is absent from markets pages.
-            # It may be a valid CoinGecko id outside the currently fetched markets universe.
             pending_coingecko_ids.append(cid_norm)
             debug_by_symbol[key] = DebugSymbolInfo(
                 input_symbol=None,
@@ -495,9 +492,7 @@ def resolve_requested_assets(
     )
 
 
-def build_asset_sources(
-    debug_by_symbol: dict[str, DebugSymbolInfo],
-) -> dict[str, dict]:
+def build_asset_sources(debug_by_symbol: dict[str, DebugSymbolInfo]) -> dict[str, dict]:
     mapping: dict[str, dict] = {}
 
     for _, debug in debug_by_symbol.items():
@@ -652,6 +647,60 @@ def classify_universe_filter_from_market(coin: dict) -> tuple[str, str]:
     return "included_for_scoring", "included_for_scoring"
 
 
+async def build_automatic_market_universe(
+    client: CoinGeckoClient,
+    req: ScanRequest,
+    markets: list[dict],
+) -> tuple[list[dict], dict[str, DebugSymbolInfo], dict[str, str], dict[str, dict]]:
+    candidates: list[dict] = []
+    local_debug: dict[str, DebugSymbolInfo] = {}
+    local_skip_reasons: dict[str, str] = {}
+    asset_sources: dict[str, dict] = {}
+
+    excluded_symbols = {s.lower() for s in req.exclude_symbols or []}
+
+    for coin in markets:
+        symbol = str(coin.get("symbol", "")).upper()
+        coin_id = str(coin.get("id", ""))
+        asset_key = make_asset_key_from_id(coin_id)
+
+        if str(coin.get("symbol", "")).lower() in excluded_symbols:
+            continue
+
+        market_cap = float(coin.get("market_cap") or 0)
+        volume_24h = float(coin.get("total_volume") or 0)
+
+        if market_cap < settings.min_market_cap_usd or volume_24h < settings.min_24h_volume_usd:
+            continue
+
+        universe_status, universe_reason = classify_universe_filter_from_market(coin)
+        local_debug[asset_key] = DebugSymbolInfo(
+            input_symbol=symbol,
+            input_coingecko_id=coin_id,
+            source_type="market_universe",
+            resolved=True,
+            coingecko_id=coin_id,
+            status="candidate" if universe_status == "included_for_scoring" else "skipped",
+            stage="resolve_market_universe",
+            reason=None if universe_status == "included_for_scoring" else universe_reason,
+            universe_filter_status=universe_status,
+            universe_filter_reason=universe_reason,
+        )
+
+        if universe_status != "included_for_scoring":
+            local_skip_reasons[asset_key] = universe_reason
+            continue
+
+        candidates.append(coin)
+        asset_sources[coin_id.lower()] = {
+            "source_type": "market_universe",
+            "input_symbol": symbol,
+            "input_coingecko_id": coin_id,
+        }
+
+    return dedupe_candidates_by_id(candidates), local_debug, local_skip_reasons, asset_sources
+
+
 async def scan_pattern(req: ScanRequest) -> ScanResponse:
     if req.min_age_days > req.max_age_days:
         raise HTTPException(status_code=400, detail="min_age_days must be <= max_age_days")
@@ -659,13 +708,22 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
     client = CoinGeckoClient()
 
     try:
-        pages = max(1, min(6, (req.max_coins_to_evaluate + 249) // 250))
+        if req.symbols or req.coingecko_ids:
+            pages = max(
+                1,
+                min(
+                    settings.market_universe_pages,
+                    max((len(req.symbols or []) + len(req.coingecko_ids or []) + 249) // 250, 1),
+                ),
+            )
+        else:
+            pages = settings.market_universe_pages
 
         try:
             markets = await client.get_markets(
                 vs_currency=req.vs_currency,
                 pages=pages,
-                per_page=250,
+                per_page=settings.market_universe_per_page,
             )
         except httpx.HTTPStatusError as e:
             raise HTTPException(status_code=503, detail=f"CoinGecko markets error: {e.response.status_code}")
@@ -686,7 +744,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             coingecko_ids=req.coingecko_ids,
         )
 
-        # Direct lookup fallback for ids missing from top markets pages.
         invalid_coingecko_ids: list[str] = []
         for cid in pending_coingecko_ids:
             asset_key = make_asset_key_from_id(cid)
@@ -756,60 +813,20 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         asset_sources = build_asset_sources(debug_by_symbol=debug_by_symbol)
 
         if not (req.symbols or req.coingecko_ids):
-            candidates = []
-            excluded_symbols = {s.lower() for s in req.exclude_symbols or []}
-
-            for coin in markets:
-                symbol = str(coin.get("symbol", "")).upper()
-                coin_id = str(coin.get("id", ""))
-
-                if str(coin.get("symbol", "")).lower() in excluded_symbols:
-                    continue
-
-                market_cap = float(coin.get("market_cap") or 0)
-                volume_24h = float(coin.get("total_volume") or 0)
-
-                if market_cap < settings.min_market_cap_usd or volume_24h < settings.min_24h_volume_usd:
-                    continue
-
-                universe_status, universe_reason = classify_universe_filter_from_market(coin)
-                asset_key = make_asset_key_from_id(coin_id)
-
-                debug_by_symbol[asset_key] = DebugSymbolInfo(
-                    input_symbol=symbol,
-                    input_coingecko_id=coin_id,
-                    source_type="mixed",
-                    resolved=True,
-                    coingecko_id=coin_id,
-                    status="candidate" if universe_status == "included_for_scoring" else "skipped",
-                    stage="resolve_market_universe",
-                    reason=None if universe_status == "included_for_scoring" else universe_reason,
-                    universe_filter_status=universe_status,
-                    universe_filter_reason=universe_reason,
-                )
-
-                if universe_status != "included_for_scoring":
-                    skip_reasons[asset_key] = universe_reason
-                    continue
-
-                candidates.append(coin)
-                asset_sources[coin_id.lower()] = {
-                    "source_type": "mixed",
-                    "input_symbol": symbol,
-                    "input_coingecko_id": coin_id,
-                }
-
-                if len(candidates) >= req.max_coins_to_evaluate:
-                    break
+            candidates, auto_debug, auto_skip_reasons, auto_asset_sources = await build_automatic_market_universe(
+                client=client,
+                req=req,
+                markets=markets,
+            )
+            debug_by_symbol.update(auto_debug)
+            skip_reasons.update(auto_skip_reasons)
+            asset_sources.update(auto_asset_sources)
 
         candidates = dedupe_candidates_by_id(candidates)
 
         evaluated_symbols: list[str] = []
-        skipped_symbols: list[str] = []
-
         evaluated_assets: list[str] = []
         skipped_assets: list[str] = []
-
         results: list[ScanResult] = []
 
         for coin in candidates:

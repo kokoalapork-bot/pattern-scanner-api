@@ -23,16 +23,32 @@ class Settings(BaseSettings):
     min_market_cap_usd: float = 0.0
     min_24h_volume_usd: float = 0.0
 
+    # universe filters
     exclude_stables: bool = True
     exclude_tokenized_stocks: bool = True
+    max_market_cap_usd_for_pattern: float = 15_000_000_000.0
 
+    # auth/config
     coingecko_auth_mode: str = Field(default="demo")
     coingecko_api_key: str = Field(default="")
     coingecko_base_url: str = Field(default="")
 
+    # transport behavior
     request_timeout_seconds: float = 20.0
     history_retry_count: int = 3
     history_backoff_base_seconds: float = 0.8
+
+    # stable / low-vol behavior guards
+    stable_price_peg_center: float = 1.0
+    stable_price_peg_tolerance: float = 0.15
+    stable_max_cv: float = 0.03
+    stable_max_range_ratio: float = 0.12
+    low_volatility_max_cv: float = 0.02
+    low_volatility_max_range_ratio: float = 0.08
+
+    # final score blending
+    structural_score_weight: float = 0.75
+    exemplar_consistency_weight: float = 0.25
 
     @field_validator("coingecko_auth_mode", mode="before")
     @classmethod
@@ -73,6 +89,13 @@ class Settings(BaseSettings):
         if self.coingecko_auth_mode == "pro" and "pro-api.coingecko.com" not in netloc:
             raise ValueError("pro mode must use pro-api.coingecko.com")
 
+        total_weight = self.structural_score_weight + self.exemplar_consistency_weight
+        if abs(total_weight - 1.0) > 1e-9:
+            raise ValueError("structural_score_weight + exemplar_consistency_weight must equal 1.0")
+
+        if self.max_market_cap_usd_for_pattern <= 0:
+            raise ValueError("max_market_cap_usd_for_pattern must be positive")
+
         return self
 
     @property
@@ -90,5 +113,7 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     return Settings()
 
+
+settings = get_settings()
 
 settings = get_settings()

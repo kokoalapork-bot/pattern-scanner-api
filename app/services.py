@@ -36,8 +36,6 @@ FEATURE_KEYS = [
     "template_shape",
 ]
 
-# Эталонные диапазоны — не nearest-neighbor, а калибровка допустимой формы.
-# Они задают "зону валидной базы", а не заменяют паттерн.
 EXEMPLAR_BREAKDOWNS: dict[str, dict[str, float]] = {
     "SIREN": {
         "crown": 0.42,
@@ -59,8 +57,6 @@ EXEMPLAR_BREAKDOWNS: dict[str, dict[str, float]] = {
     },
 }
 
-# lower tolerance, upper tolerance
-# crown intentionally loose on lower side so weak-crown variants can survive.
 REFERENCE_TOLERANCES: dict[str, tuple[float, float]] = {
     "crown": (0.22, 0.16),
     "drop": (0.16, 0.16),
@@ -123,15 +119,6 @@ def iter_windows(closes: list[float], min_age_days: int, max_age_days: int):
 
 
 def position_bonus(start_idx: int, end_idx: int, total_len: int) -> float:
-    """
-    Нам нужна именно база перед выходом, а не окно, которое заканчивается
-    в самой правой точке графика после уже состоявшегося пампа.
-
-    Поэтому:
-    - сильный штраф, если окно упирается в край,
-    - бонус, если справа остается небольшой, но не нулевой хвост,
-    - штраф за слишком ранние окна.
-    """
     if total_len <= 0:
         return 0.0
 
@@ -142,7 +129,6 @@ def position_bonus(start_idx: int, end_idx: int, total_len: int) -> float:
     if end_ratio < 0.35:
         return 0.25
 
-    # После базы должен оставаться небольшой запас справа.
     if right_tail <= 1:
         return 0.10
     if right_tail <= 3:
@@ -152,7 +138,6 @@ def position_bonus(start_idx: int, end_idx: int, total_len: int) -> float:
     if right_tail <= 14:
         return 1.00
 
-    # Если справа слишком много хвоста, окно слишком раннее.
     target = 0.82
     distance = abs(end_ratio - target)
     pos_score = max(0.0, 1.0 - distance / 0.35)
@@ -222,16 +207,6 @@ def compute_pre_breakout_guardrails(
     best_window_end: int,
     total_len: int,
 ) -> dict[str, float | bool]:
-    """
-    Жесткие визуальные guardrails именно под твое требование:
-    нужен не памп, а база до пампа.
-
-    Ключевые идеи:
-    - long shelf must be real
-    - crown/spikes inside base are allowed
-    - right edge should show preparation, not already fully gone
-    - окно не должно заканчиваться на самом правом выносе
-    """
     shelf = breakdown_dict["shelf"]
     crown = breakdown_dict["crown"]
     spike = breakdown_dict["right_spike"]
@@ -247,11 +222,8 @@ def compute_pre_breakout_guardrails(
         and spike >= 0.35
         and reversion >= 0.30
     )
-
-    # active/forming are preferred for "base before breakout".
     stage_ok = stage in {"forming", "active"}
 
-    # full pre-breakout base confidence
     pre_breakout_base_score = 0.0
     pre_breakout_base_score += min(1.0, max(0.0, (shelf - 0.45) / 0.35)) * 0.30
     pre_breakout_base_score += min(1.0, max(0.0, (template - 0.40) / 0.35)) * 0.20
@@ -290,8 +262,6 @@ def classify_final_label(
     if not left_structure_ok:
         return "reject"
 
-    # Strong match only if real pre-breakout base is present on the left,
-    # reference band is passed, and the candidate is not just "right-edge pump".
     if (
         structural_score >= 62.0
         and exemplar_consistency_score >= 55.0
@@ -337,7 +307,6 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
         structural_score = float(result.similarity)
         effective_structural = structural_score * (0.70 + 0.30 * pos)
 
-        # If the window ends right at the edge, it is likely just the breakout/pump zone.
         if (total_len - end_idx) <= 1:
             effective_structural *= 0.40
 
@@ -350,13 +319,10 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
             total_len=total_len,
         )
 
-        # Final blended score still remains pattern-first.
         final_score = combine_scores(
             structural_score=effective_structural,
             exemplar_consistency_score=float(exemplar_metrics["exemplar_consistency_score"]),
         )
-
-        # Small additional preference for true pre-breakout bases.
         final_score = round(
             final_score * (0.82 + 0.18 * (float(pre_breakout["pre_breakout_base_score"]) / 100.0)),
             2,
@@ -403,85 +369,180 @@ def build_symbol_index(markets: list[dict]) -> Dict[str, list[dict]]:
     return index
 
 
-def resolve_requested_coins(
+def build_id_index(markets: list[dict]) -> Dict[str, dict]:
+    return {str(c.get("id", "")).lower(): c for c in markets if str(c.get("id", "")).strip()}
+
+
+def make_asset_key_from_symbol(symbol: str) -> str:
+    return f"symbol:{symbol.upper()}"
+
+
+def make_asset_key_from_id(coingecko_id: str) -> str:
+    return f"id:{coingecko_id.lower()}"
+
+
+def dedupe_candidates_by_id(candidates: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    out: list[dict] = []
+
+    for coin in candidates:
+        coin_id = str(coin.get("id", "")).lower()
+        if not coin_id or coin_id in seen:
+            continue
+        seen.add(coin_id)
+        out.append(coin)
+
+    return out
+
+
+def resolve_requested_assets(
     markets: list[dict],
     symbols: Optional[list[str]],
     coingecko_ids: Optional[list[str]],
 ):
-    resolved: list[dict] = []
+    resolved_candidates: list[dict] = []
+
     resolved_symbols: list[str] = []
     unresolved_symbols: list[str] = []
+
+    resolved_coingecko_ids: list[str] = []
+    invalid_coingecko_ids: list[str] = []
+
     skip_reasons: dict[str, str] = {}
     debug_by_symbol: dict[str, DebugSymbolInfo] = {}
 
-    by_id = {str(c.get("id")): c for c in markets}
     by_symbol = build_symbol_index(markets)
+    by_id = build_id_index(markets)
 
-    if coingecko_ids:
-        for cid in coingecko_ids:
-            coin = by_id.get(cid)
-            if coin:
-                sym = str(coin.get("symbol", "")).upper()
-                resolved.append(coin)
-                resolved_symbols.append(sym)
-                debug_by_symbol[sym] = DebugSymbolInfo(
-                    input_symbol=cid,
-                    resolved=True,
-                    coingecko_id=str(coin.get("id")),
-                    status="resolved",
-                    stage="resolve_symbol",
-                    reason=None,
-                )
-            else:
-                unresolved_symbols.append(cid)
-                skip_reasons[cid] = "unresolved_symbol"
-                debug_by_symbol[cid] = DebugSymbolInfo(
-                    input_symbol=cid,
-                    resolved=False,
-                    coingecko_id=None,
-                    status="unresolved",
-                    stage="resolve_symbol",
-                    reason="unresolved_symbol",
-                )
-        return resolved, resolved_symbols, unresolved_symbols, skip_reasons, debug_by_symbol
+    # symbol path
+    for sym in symbols or []:
+        key = make_asset_key_from_symbol(sym)
+        matches = by_symbol.get(sym.lower(), [])
 
-    if symbols:
-        for sym in symbols:
-            key = sym.upper()
-            matches = by_symbol.get(sym.lower(), [])
-            if matches:
-                chosen = sorted(matches, key=lambda x: float(x.get("market_cap") or 0), reverse=True)[0]
-                resolved.append(chosen)
-                resolved_symbols.append(key)
-                debug_by_symbol[key] = DebugSymbolInfo(
-                    input_symbol=key,
-                    resolved=True,
-                    coingecko_id=str(chosen.get("id")),
-                    status="resolved",
-                    stage="resolve_symbol",
-                    reason=None,
-                )
-            else:
-                unresolved_symbols.append(key)
-                skip_reasons[key] = "unresolved_symbol"
-                debug_by_symbol[key] = DebugSymbolInfo(
-                    input_symbol=key,
-                    resolved=False,
-                    coingecko_id=None,
-                    status="unresolved",
-                    stage="resolve_symbol",
-                    reason="unresolved_symbol",
-                )
+        if matches:
+            chosen = sorted(matches, key=lambda x: float(x.get("market_cap") or 0), reverse=True)[0]
+            resolved_candidates.append(chosen)
+            resolved_symbols.append(sym.upper())
 
-    return resolved, resolved_symbols, unresolved_symbols, skip_reasons, debug_by_symbol
+            debug_by_symbol[key] = DebugSymbolInfo(
+                input_symbol=sym.upper(),
+                input_coingecko_id=None,
+                source_type="symbol",
+                resolved=True,
+                coingecko_id=str(chosen.get("id")),
+                status="resolved",
+                stage="resolve_symbol",
+                reason=None,
+            )
+        else:
+            unresolved_symbols.append(sym.upper())
+            skip_reasons[key] = "unresolved_symbol"
+            debug_by_symbol[key] = DebugSymbolInfo(
+                input_symbol=sym.upper(),
+                input_coingecko_id=None,
+                source_type="symbol",
+                resolved=False,
+                coingecko_id=None,
+                status="unresolved",
+                stage="resolve_symbol",
+                reason="unresolved_symbol",
+            )
+
+    # direct coingecko_id path
+    for cid in coingecko_ids or []:
+        cid_norm = cid.lower()
+        key = make_asset_key_from_id(cid_norm)
+
+        coin = by_id.get(cid_norm)
+        if coin:
+            resolved_candidates.append(coin)
+            resolved_coingecko_ids.append(cid_norm)
+
+            debug_by_symbol[key] = DebugSymbolInfo(
+                input_symbol=None,
+                input_coingecko_id=cid_norm,
+                source_type="coingecko_id",
+                resolved=True,
+                coingecko_id=cid_norm,
+                status="resolved",
+                stage="resolve_coingecko_id",
+                reason=None,
+            )
+        else:
+            # Do not fake unresolved_symbol here.
+            invalid_coingecko_ids.append(cid_norm)
+            skip_reasons[key] = "invalid_coingecko_id"
+            debug_by_symbol[key] = DebugSymbolInfo(
+                input_symbol=None,
+                input_coingecko_id=cid_norm,
+                source_type="coingecko_id",
+                resolved=False,
+                coingecko_id=cid_norm,
+                status="invalid",
+                stage="resolve_coingecko_id",
+                reason="invalid_coingecko_id",
+            )
+
+    resolved_candidates = dedupe_candidates_by_id(resolved_candidates)
+
+    return (
+        resolved_candidates,
+        resolved_symbols,
+        unresolved_symbols,
+        resolved_coingecko_ids,
+        invalid_coingecko_ids,
+        skip_reasons,
+        debug_by_symbol,
+    )
+
+
+def build_asset_sources(
+    symbols: Optional[list[str]],
+    coingecko_ids: Optional[list[str]],
+    debug_by_symbol: dict[str, DebugSymbolInfo],
+) -> dict[str, dict]:
+    """
+    Returns:
+      coingecko_id -> {
+        "source_type": "symbol" | "coingecko_id" | "mixed",
+        "input_symbol": ...,
+        "input_coingecko_id": ...
+      }
+    """
+    mapping: dict[str, dict] = {}
+
+    for _, debug in debug_by_symbol.items():
+        if not debug.resolved or not debug.coingecko_id:
+            continue
+
+        cid = debug.coingecko_id.lower()
+        slot = mapping.setdefault(
+            cid,
+            {
+                "source_type": debug.source_type,
+                "input_symbol": debug.input_symbol,
+                "input_coingecko_id": debug.input_coingecko_id,
+            },
+        )
+
+        if slot["source_type"] != debug.source_type:
+            slot["source_type"] = "mixed"
+
+        if not slot["input_symbol"] and debug.input_symbol:
+            slot["input_symbol"] = debug.input_symbol
+
+        if not slot["input_coingecko_id"] and debug.input_coingecko_id:
+            slot["input_coingecko_id"] = debug.input_coingecko_id
+
+    return mapping
 
 
 def mark_skipped(
-    symbol: str,
+    asset_key: str,
     coingecko_id: str | None,
     reason: str,
     stage: str,
-    skipped_symbols: list[str],
+    skipped_assets: list[str],
     skip_reasons: dict[str, str],
     debug_by_symbol: dict[str, DebugSymbolInfo],
     endpoint: str | None = None,
@@ -504,12 +565,16 @@ def mark_skipped(
     raw_similarity: float | None = None,
     label: str | None = None,
 ):
-    if symbol not in skipped_symbols:
-        skipped_symbols.append(symbol)
+    if asset_key not in skipped_assets:
+        skipped_assets.append(asset_key)
 
-    skip_reasons[symbol] = reason
-    debug_by_symbol[symbol] = DebugSymbolInfo(
-        input_symbol=symbol,
+    skip_reasons[asset_key] = reason
+
+    existing = debug_by_symbol.get(asset_key, DebugSymbolInfo())
+    debug_by_symbol[asset_key] = DebugSymbolInfo(
+        input_symbol=existing.input_symbol,
+        input_coingecko_id=existing.input_coingecko_id,
+        source_type=existing.source_type,
         resolved=coingecko_id is not None,
         coingecko_id=coingecko_id,
         status="skipped",
@@ -538,31 +603,31 @@ def mark_skipped(
 
 
 def validate_scan_invariants(
-    unresolved_symbols: list[str],
-    skipped_symbols: list[str],
-    evaluated_symbols: list[str],
+    invalid_or_unresolved_assets: list[str],
+    skipped_assets: list[str],
+    evaluated_assets: list[str],
     skip_reasons: dict[str, str],
     debug_by_symbol: dict[str, DebugSymbolInfo],
     evaluated_count: int,
 ) -> None:
-    if evaluated_count > 0 and not evaluated_symbols:
-        raise RuntimeError("Invariant violation: evaluated_count > 0 but evaluated_symbols is empty")
+    if evaluated_count > 0 and not evaluated_assets:
+        raise RuntimeError("Invariant violation: evaluated_count > 0 but evaluated_assets is empty")
 
-    for symbol in skipped_symbols:
-        if symbol not in skip_reasons:
-            raise RuntimeError(f"Invariant violation: skipped symbol {symbol} missing skip_reason")
-        if symbol not in debug_by_symbol:
-            raise RuntimeError(f"Invariant violation: skipped symbol {symbol} missing debug entry")
-        if debug_by_symbol[symbol].reason != skip_reasons[symbol]:
-            raise RuntimeError(f"Invariant violation: skip reason mismatch for {symbol}")
+    for asset_key in skipped_assets:
+        if asset_key not in skip_reasons:
+            raise RuntimeError(f"Invariant violation: skipped asset {asset_key} missing skip_reason")
+        if asset_key not in debug_by_symbol:
+            raise RuntimeError(f"Invariant violation: skipped asset {asset_key} missing debug entry")
+        if debug_by_symbol[asset_key].reason != skip_reasons[asset_key]:
+            raise RuntimeError(f"Invariant violation: skip reason mismatch for {asset_key}")
 
-    final_sets_overlap = (
-        set(unresolved_symbols) & set(skipped_symbols),
-        set(unresolved_symbols) & set(evaluated_symbols),
-        set(skipped_symbols) & set(evaluated_symbols),
+    overlaps = (
+        set(invalid_or_unresolved_assets) & set(skipped_assets),
+        set(invalid_or_unresolved_assets) & set(evaluated_assets),
+        set(skipped_assets) & set(evaluated_assets),
     )
-    if any(overlap for overlap in final_sets_overlap):
-        raise RuntimeError("Invariant violation: a symbol appears in more than one final category")
+    if any(x for x in overlaps):
+        raise RuntimeError("Invariant violation: an asset appears in more than one final category")
 
 
 def classify_universe_filter_from_market(coin: dict) -> tuple[str, str]:
@@ -607,24 +672,28 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         except httpx.HTTPError as e:
             raise HTTPException(status_code=503, detail=f"CoinGecko connection error: {str(e)}")
 
-        explicit_mode = bool(req.symbols or req.coingecko_ids)
+        (
+            candidates,
+            resolved_symbols,
+            unresolved_symbols,
+            resolved_coingecko_ids,
+            invalid_coingecko_ids,
+            skip_reasons,
+            debug_by_symbol,
+        ) = resolve_requested_assets(
+            markets=markets,
+            symbols=req.symbols,
+            coingecko_ids=req.coingecko_ids,
+        )
 
-        resolved_symbols: list[str] = []
-        unresolved_symbols: list[str] = []
-        evaluated_symbols: list[str] = []
-        skipped_symbols: list[str] = []
-        skip_reasons: dict[str, str] = {}
-        debug_by_symbol: dict[str, DebugSymbolInfo] = {}
+        asset_sources = build_asset_sources(
+            symbols=req.symbols,
+            coingecko_ids=req.coingecko_ids,
+            debug_by_symbol=debug_by_symbol,
+        )
 
-        if explicit_mode:
-            candidates, resolved_symbols, unresolved_symbols, initial_skip_reasons, initial_debug = resolve_requested_coins(
-                markets=markets,
-                symbols=req.symbols,
-                coingecko_ids=req.coingecko_ids,
-            )
-            skip_reasons.update(initial_skip_reasons)
-            debug_by_symbol.update(initial_debug)
-        else:
+        # broad market mode fallback
+        if not (req.symbols or req.coingecko_ids):
             candidates = []
             excluded_symbols = {s.lower() for s in req.exclude_symbols or []}
 
@@ -643,26 +712,40 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     continue
 
                 universe_status, universe_reason = classify_universe_filter_from_market(coin)
-                debug_by_symbol[symbol] = DebugSymbolInfo(
+                asset_key = make_asset_key_from_id(coin_id)
+
+                debug_by_symbol[asset_key] = DebugSymbolInfo(
                     input_symbol=symbol,
+                    input_coingecko_id=coin_id,
+                    source_type="mixed",
                     resolved=True,
                     coingecko_id=coin_id,
                     status="candidate" if universe_status == "included_for_scoring" else "skipped",
-                    stage="resolve_symbol",
+                    stage="resolve_market_universe",
                     reason=None if universe_status == "included_for_scoring" else universe_reason,
                     universe_filter_status=universe_status,
                     universe_filter_reason=universe_reason,
                 )
 
                 if universe_status != "included_for_scoring":
-                    skipped_symbols.append(symbol)
-                    skip_reasons[symbol] = universe_reason
+                    skip_reasons[asset_key] = universe_reason
                     continue
 
                 candidates.append(coin)
+                asset_sources[coin_id.lower()] = {
+                    "source_type": "mixed",
+                    "input_symbol": symbol,
+                    "input_coingecko_id": coin_id,
+                }
 
                 if len(candidates) >= req.max_coins_to_evaluate:
                     break
+
+        evaluated_symbols: list[str] = []
+        skipped_symbols: list[str] = []
+
+        evaluated_assets: list[str] = []
+        skipped_assets: list[str] = []
 
         results: list[ScanResult] = []
 
@@ -671,13 +754,23 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             symbol = str(coin.get("symbol", "")).upper()
             name = str(coin.get("name", ""))
 
+            source_meta = asset_sources.get(
+                coin_id.lower(),
+                {
+                    "source_type": "coingecko_id",
+                    "input_symbol": symbol,
+                    "input_coingecko_id": coin_id,
+                },
+            )
+            asset_key = make_asset_key_from_id(coin_id)
+
             if not coin_id:
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=None,
                     reason="coingecko_id_missing",
                     stage="fetch_market_data",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     universe_filter_status="included_for_scoring",
@@ -688,11 +781,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             pre_universe_status, pre_universe_reason = classify_universe_filter_from_market(coin)
             if pre_universe_status != "included_for_scoring":
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason=pre_universe_reason,
-                    stage="resolve_symbol",
-                    skipped_symbols=skipped_symbols,
+                    stage="resolve_asset",
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     universe_filter_status=pre_universe_status,
@@ -703,8 +796,10 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             requested_history_days = min(450, req.max_age_days)
             effective_history_days, days_capped = client.normalize_history_days(requested_history_days)
 
-            debug_by_symbol[symbol] = DebugSymbolInfo(
-                input_symbol=symbol,
+            debug_by_symbol[asset_key] = DebugSymbolInfo(
+                input_symbol=source_meta.get("input_symbol"),
+                input_coingecko_id=source_meta.get("input_coingecko_id"),
+                source_type=source_meta.get("source_type"),
                 resolved=True,
                 coingecko_id=coin_id,
                 status="fetching",
@@ -739,12 +834,16 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             )
 
             if not fetch.ok:
+                reason = fetch.reason or "history_fetch_failed"
+                if reason == "history_http_404":
+                    reason = "invalid_coingecko_id"
+
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
-                    reason=fetch.reason or "history_fetch_failed",
+                    reason=reason,
                     stage="fetch_market_data",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     endpoint=fetch.endpoint,
@@ -766,11 +865,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             behavioral_status, behavioral_reason = classify_behavioral_universe_filter(closes)
             if behavioral_status != "included_for_scoring":
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason=behavioral_reason,
                     stage="fetch_market_data",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     endpoint=fetch.endpoint,
@@ -788,11 +887,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
             if len(closes) == 0:
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason="history_empty",
                     stage="fetch_market_data",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     endpoint=fetch.endpoint,
@@ -810,11 +909,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
             if len(closes) < 30:
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason="insufficient_history",
                     stage="fetch_market_data",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     endpoint=fetch.endpoint,
@@ -833,11 +932,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             asset_age_days = age_from_chart_days(chart)
             if asset_age_days is None:
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason="history_bad_response_schema",
                     stage="fetch_market_data",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     endpoint=fetch.endpoint,
@@ -853,13 +952,13 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 )
                 continue
 
-            if not explicit_mode and (asset_age_days < req.min_age_days or asset_age_days > req.max_age_days):
+            if not (req.symbols or req.coingecko_ids) and (asset_age_days < req.min_age_days or asset_age_days > req.max_age_days):
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason="filtered_before_scoring",
                     stage="filter_result",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     auth_mode=fetch.auth_mode,
@@ -871,8 +970,10 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 )
                 continue
 
-            debug_by_symbol[symbol] = DebugSymbolInfo(
-                input_symbol=symbol,
+            debug_by_symbol[asset_key] = DebugSymbolInfo(
+                input_symbol=source_meta.get("input_symbol"),
+                input_coingecko_id=source_meta.get("input_coingecko_id"),
+                source_type=source_meta.get("source_type"),
                 resolved=True,
                 coingecko_id=coin_id,
                 status="building_windows",
@@ -894,11 +995,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 best = find_best_window(closes, req.min_age_days, min(req.max_age_days, len(closes)))
             except ScoringError as e:
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason="scoring_error",
                     stage="score_windows",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     error_message=str(e),
@@ -912,11 +1013,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 continue
             except Exception as e:
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason="window_generation_failed",
                     stage="build_windows",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     error_message=f"{type(e).__name__}: {e}",
@@ -931,11 +1032,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
             if best is None:
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason="insufficient_history",
                     stage="build_windows",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     auth_mode=fetch.auth_mode,
@@ -961,11 +1062,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
             if final_label == "reject":
                 mark_skipped(
-                    symbol=symbol,
+                    asset_key=asset_key,
                     coingecko_id=coin_id,
                     reason="filtered_after_scoring",
                     stage="score_windows",
-                    skipped_symbols=skipped_symbols,
+                    skipped_assets=skipped_assets,
                     skip_reasons=skip_reasons,
                     debug_by_symbol=debug_by_symbol,
                     endpoint=fetch.endpoint,
@@ -994,9 +1095,13 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 )
                 continue
 
+            evaluated_assets.append(asset_key)
             evaluated_symbols.append(symbol)
-            debug_by_symbol[symbol] = DebugSymbolInfo(
-                input_symbol=symbol,
+
+            debug_by_symbol[asset_key] = DebugSymbolInfo(
+                input_symbol=source_meta.get("input_symbol"),
+                input_coingecko_id=source_meta.get("input_coingecko_id"),
+                source_type=source_meta.get("source_type"),
                 resolved=True,
                 coingecko_id=coin_id,
                 status="evaluated",
@@ -1084,23 +1189,38 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         results.sort(key=lambda x: x.similarity, reverse=True)
         final_results = results[: req.top_k]
 
+        invalid_or_unresolved_assets = (
+            [make_asset_key_from_symbol(s) for s in unresolved_symbols]
+            + [make_asset_key_from_id(cid) for cid in invalid_coingecko_ids]
+        )
+
+        skipped_symbols = [
+            debug.input_symbol
+            for key, debug in debug_by_symbol.items()
+            if key in skipped_assets and debug.input_symbol
+        ]
+
         validate_scan_invariants(
-            unresolved_symbols=unresolved_symbols,
-            skipped_symbols=skipped_symbols,
-            evaluated_symbols=evaluated_symbols,
+            invalid_or_unresolved_assets=invalid_or_unresolved_assets,
+            skipped_assets=skipped_assets,
+            evaluated_assets=evaluated_assets,
             skip_reasons=skip_reasons,
             debug_by_symbol=debug_by_symbol,
-            evaluated_count=len(evaluated_symbols),
+            evaluated_count=len(evaluated_assets),
         )
 
         return ScanResponse(
             pattern_name=req.pattern_name,
-            evaluated_count=len(evaluated_symbols),
+            evaluated_count=len(evaluated_assets),
             returned_count=len(final_results),
             resolved_symbols=resolved_symbols,
             unresolved_symbols=unresolved_symbols,
+            resolved_coingecko_ids=resolved_coingecko_ids,
+            invalid_coingecko_ids=invalid_coingecko_ids,
             evaluated_symbols=evaluated_symbols,
             skipped_symbols=skipped_symbols,
+            evaluated_assets=evaluated_assets,
+            skipped_assets=skipped_assets,
             skip_reasons=skip_reasons,
             debug_by_symbol=debug_by_symbol,
             results=final_results,

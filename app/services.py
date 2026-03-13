@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -20,6 +20,10 @@ from .models import (
     ScanResult,
 )
 from .patterns import score_crown_shelf_right_spike
+
+
+class ScoringError(RuntimeError):
+    pass
 
 
 def age_from_chart_days(chart: dict) -> int | None:
@@ -107,7 +111,11 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
         closes, min_age_days, max_age_days
     ):
         candidate_windows_count += 1
-        result = score_crown_shelf_right_spike(window_closes)
+
+        try:
+            result = score_crown_shelf_right_spike(window_closes)
+        except Exception as e:
+            raise ScoringError(f"{type(e).__name__}: {e}") from e
 
         pos = position_bonus(start_idx, end_idx, total_len)
         raw_similarity = float(result.similarity)
@@ -129,9 +137,12 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
                 "best_window_start": start_idx,
                 "best_window_end": end_idx,
                 "best_age_days": window_len,
-                "candidate_windows_count": candidate_windows_count,
             }
 
+    if best is None:
+        return None
+
+    best["candidate_windows_count"] = candidate_windows_count
     return best
 
 
@@ -155,20 +166,21 @@ def resolve_requested_coins(
     unresolved_symbols: list[str] = []
     skip_reasons: dict[str, str] = {}
     debug_by_symbol: dict[str, DebugSymbolInfo] = {}
+    requested_keys: list[str] = []
 
     by_id = {str(c.get("id")): c for c in markets}
     by_symbol = build_symbol_index(markets)
 
     if coingecko_ids:
         for cid in coingecko_ids:
+            requested_keys.append(cid)
             coin = by_id.get(cid)
-            key = cid
             if coin:
                 sym = str(coin.get("symbol", "")).upper()
                 resolved.append(coin)
                 resolved_symbols.append(sym)
-                debug_by_symbol[key] = DebugSymbolInfo(
-                    input_symbol=key,
+                debug_by_symbol[sym] = DebugSymbolInfo(
+                    input_symbol=cid,
                     resolved=True,
                     coingecko_id=str(coin.get("id")),
                     status="resolved",
@@ -176,21 +188,22 @@ def resolve_requested_coins(
                     reason=None,
                 )
             else:
-                unresolved_symbols.append(key)
-                skip_reasons[key] = "unresolved_symbol"
-                debug_by_symbol[key] = DebugSymbolInfo(
-                    input_symbol=key,
+                unresolved_symbols.append(cid)
+                skip_reasons[cid] = "unresolved_symbol"
+                debug_by_symbol[cid] = DebugSymbolInfo(
+                    input_symbol=cid,
                     resolved=False,
                     coingecko_id=None,
                     status="unresolved",
                     stage="resolve_symbol",
                     reason="unresolved_symbol",
                 )
-        return resolved, resolved_symbols, unresolved_symbols, skip_reasons, debug_by_symbol
+        return resolved, resolved_symbols, unresolved_symbols, skip_reasons, debug_by_symbol, requested_keys
 
     if symbols:
         for sym in symbols:
             key = sym.upper()
+            requested_keys.append(key)
             matches = by_symbol.get(sym.lower(), [])
             if matches:
                 chosen = sorted(matches, key=lambda x: float(x.get("market_cap") or 0), reverse=True)[0]
@@ -216,7 +229,7 @@ def resolve_requested_coins(
                     reason="unresolved_symbol",
                 )
 
-    return resolved, resolved_symbols, unresolved_symbols, skip_reasons, debug_by_symbol
+    return resolved, resolved_symbols, unresolved_symbols, skip_reasons, debug_by_symbol, requested_keys
 
 
 def mark_skipped(
@@ -234,6 +247,7 @@ def mark_skipped(
     auth_mode: str | None = None,
     base_url: str | None = None,
     api_key_present: bool | None = None,
+    auth_header_name: str | None = None,
     candidate_windows_count: int | None = None,
     best_window: dict | None = None,
     raw_similarity: float | None = None,
@@ -241,6 +255,7 @@ def mark_skipped(
 ):
     if symbol not in skipped_symbols:
         skipped_symbols.append(symbol)
+
     skip_reasons[symbol] = reason
     debug_by_symbol[symbol] = DebugSymbolInfo(
         input_symbol=symbol,
@@ -256,6 +271,7 @@ def mark_skipped(
         auth_mode=auth_mode,
         base_url=base_url,
         api_key_present=api_key_present,
+        auth_header_name=auth_header_name,
         candidate_windows_count=candidate_windows_count,
         best_window=best_window,
         raw_similarity=raw_similarity,
@@ -264,7 +280,6 @@ def mark_skipped(
 
 
 def validate_scan_invariants(
-    requested_keys: list[str],
     unresolved_symbols: list[str],
     skipped_symbols: list[str],
     evaluated_symbols: list[str],
@@ -272,24 +287,24 @@ def validate_scan_invariants(
     debug_by_symbol: dict[str, DebugSymbolInfo],
     evaluated_count: int,
 ) -> None:
-    unresolved_set = set(unresolved_symbols)
-    skipped_set = set(skipped_symbols)
-    evaluated_set = set(evaluated_symbols)
-
     if evaluated_count > 0 and not evaluated_symbols:
         raise RuntimeError("Invariant violation: evaluated_count > 0 but evaluated_symbols is empty")
 
     for symbol in skipped_symbols:
         if symbol not in skip_reasons:
             raise RuntimeError(f"Invariant violation: skipped symbol {symbol} missing skip_reason")
-        debug_reason = debug_by_symbol.get(symbol).reason if symbol in debug_by_symbol else None
-        if debug_reason != skip_reasons[symbol]:
+        if symbol not in debug_by_symbol:
+            raise RuntimeError(f"Invariant violation: skipped symbol {symbol} missing debug entry")
+        if debug_by_symbol[symbol].reason != skip_reasons[symbol]:
             raise RuntimeError(f"Invariant violation: skip reason mismatch for {symbol}")
 
-    for key in requested_keys:
-        membership = int(key in unresolved_set) + int(key in skipped_set) + int(key in evaluated_set)
-        if membership != 1:
-            raise RuntimeError(f"Invariant violation: {key} must end in exactly one final category")
+    final_sets_overlap = (
+        set(unresolved_symbols) & set(skipped_symbols),
+        set(unresolved_symbols) & set(evaluated_symbols),
+        set(skipped_symbols) & set(evaluated_symbols),
+    )
+    if any(overlap for overlap in final_sets_overlap):
+        raise RuntimeError("Invariant violation: a symbol appears in more than one final category")
 
 
 async def scan_pattern(req: ScanRequest) -> ScanResponse:
@@ -322,18 +337,23 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         debug_by_symbol: dict[str, DebugSymbolInfo] = {}
 
         if explicit_mode:
-            candidates, resolved_symbols, unresolved_symbols, initial_skip_reasons, initial_debug = resolve_requested_coins(
+            (
+                candidates,
+                resolved_symbols,
+                unresolved_symbols,
+                initial_skip_reasons,
+                initial_debug,
+                _requested_keys,
+            ) = resolve_requested_coins(
                 markets=markets,
                 symbols=req.symbols,
                 coingecko_ids=req.coingecko_ids,
             )
             skip_reasons.update(initial_skip_reasons)
             debug_by_symbol.update(initial_debug)
-            input_keys = list(req.coingecko_ids or [s.upper() for s in (req.symbols or [])])
         else:
             candidates = []
             excluded_symbols = {s.lower() for s in req.exclude_symbols or []}
-            input_keys = []
 
             for coin in markets:
                 symbol = str(coin.get("symbol", "")).upper()
@@ -356,7 +376,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     continue
 
                 candidates.append(coin)
-                input_keys.append(symbol)
                 debug_by_symbol[symbol] = DebugSymbolInfo(
                     input_symbol=symbol,
                     resolved=True,
@@ -378,12 +397,17 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
             if not coin_id:
                 mark_skipped(
-                    symbol, None, "coingecko_id_missing", "fetch_market_data",
-                    skipped_symbols, skip_reasons, debug_by_symbol
+                    symbol=symbol,
+                    coingecko_id=None,
+                    reason="coingecko_id_missing",
+                    stage="fetch_market_data",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
                 )
                 continue
 
-            history_days = min(450, req.max_age_days if not explicit_mode else 450)
+            history_days = min(450, req.max_age_days)
 
             debug_by_symbol[symbol] = DebugSymbolInfo(
                 input_symbol=symbol,
@@ -393,10 +417,15 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 stage="fetch_market_data",
                 reason=None,
                 endpoint="/coins/{id}/market_chart",
-                request_params={"vs_currency": req.vs_currency, "days": str(history_days), "interval": "daily"},
+                request_params={
+                    "vs_currency": req.vs_currency,
+                    "days": str(history_days),
+                    "interval": "daily",
+                },
                 auth_mode=client.auth.mode,
                 base_url=client.auth.base_url,
                 api_key_present=client.auth.api_key_present,
+                auth_header_name=client.auth.header_name,
             )
 
             fetch = await client.fetch_market_history(
@@ -422,6 +451,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     auth_mode=fetch.auth_mode,
                     base_url=fetch.base_url,
                     api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
                 )
                 continue
 
@@ -430,8 +460,13 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
             if len(closes) == 0:
                 mark_skipped(
-                    symbol, coin_id, "history_empty", "fetch_market_data",
-                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason="history_empty",
+                    stage="fetch_market_data",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
                     endpoint=fetch.endpoint,
                     http_status=fetch.http_status,
                     request_params=fetch.request_params,
@@ -439,13 +474,19 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     auth_mode=fetch.auth_mode,
                     base_url=fetch.base_url,
                     api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
                 )
                 continue
 
             if len(closes) < 30:
                 mark_skipped(
-                    symbol, coin_id, "insufficient_history", "fetch_market_data",
-                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason="insufficient_history",
+                    stage="fetch_market_data",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
                     endpoint=fetch.endpoint,
                     http_status=fetch.http_status,
                     request_params=fetch.request_params,
@@ -453,14 +494,20 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     auth_mode=fetch.auth_mode,
                     base_url=fetch.base_url,
                     api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
                 )
                 continue
 
             asset_age_days = age_from_chart_days(chart)
             if asset_age_days is None:
                 mark_skipped(
-                    symbol, coin_id, "history_bad_response_schema", "fetch_market_data",
-                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason="history_bad_response_schema",
+                    stage="fetch_market_data",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
                     endpoint=fetch.endpoint,
                     http_status=fetch.http_status,
                     request_params=fetch.request_params,
@@ -468,16 +515,23 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     auth_mode=fetch.auth_mode,
                     base_url=fetch.base_url,
                     api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
                 )
                 continue
 
             if not explicit_mode and (asset_age_days < req.min_age_days or asset_age_days > req.max_age_days):
                 mark_skipped(
-                    symbol, coin_id, "filtered_before_scoring", "filter_result",
-                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason="filtered_before_scoring",
+                    stage="filter_result",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
                     auth_mode=fetch.auth_mode,
                     base_url=fetch.base_url,
                     api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
                 )
                 continue
 
@@ -487,34 +541,65 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 coingecko_id=coin_id,
                 status="building_windows",
                 stage="build_windows",
+                reason=None,
                 endpoint=fetch.endpoint,
                 http_status=200,
                 request_params=fetch.request_params,
+                error_message=None,
                 auth_mode=fetch.auth_mode,
                 base_url=fetch.base_url,
                 api_key_present=fetch.api_key_present,
+                auth_header_name=fetch.auth_header_name,
             )
 
             try:
                 best = find_best_window(closes, req.min_age_days, req.max_age_days)
+            except ScoringError as e:
+                mark_skipped(
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason="scoring_error",
+                    stage="score_windows",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
+                    error_message=str(e),
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
+                )
+                continue
             except Exception as e:
                 mark_skipped(
-                    symbol, coin_id, "window_generation_failed", "build_windows",
-                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason="window_generation_failed",
+                    stage="build_windows",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
                     error_message=f"{type(e).__name__}: {e}",
                     auth_mode=fetch.auth_mode,
                     base_url=fetch.base_url,
                     api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
                 )
                 continue
 
             if best is None:
                 mark_skipped(
-                    symbol, coin_id, "insufficient_history", "build_windows",
-                    skipped_symbols, skip_reasons, debug_by_symbol,
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason="insufficient_history",
+                    stage="build_windows",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
                     auth_mode=fetch.auth_mode,
                     base_url=fetch.base_url,
                     api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
                 )
                 continue
 
@@ -525,12 +610,15 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 coingecko_id=coin_id,
                 status="evaluated",
                 stage="score_windows",
+                reason=None,
                 endpoint=fetch.endpoint,
                 http_status=200,
                 request_params=fetch.request_params,
+                error_message=None,
                 auth_mode=fetch.auth_mode,
                 base_url=fetch.base_url,
                 api_key_present=fetch.api_key_present,
+                auth_header_name=fetch.auth_header_name,
                 candidate_windows_count=int(best["candidate_windows_count"]),
                 best_window={
                     "start_idx": int(best["best_window_start"]),
@@ -567,8 +655,8 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                         start_idx=int(best["best_window_start"]),
                         end_idx=int(best["best_window_end"]),
                         length_days=int(best["best_window_len"]),
-                        candidate_windows_count=int(best["candidate_windows_count"]),
                         best_age_days=int(best["best_age_days"]),
+                        candidate_windows_count=int(best["candidate_windows_count"]),
                     ),
                     notes=notes,
                 )
@@ -578,7 +666,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         final_results = results[: req.top_k]
 
         validate_scan_invariants(
-            requested_keys=input_keys,
             unresolved_symbols=unresolved_symbols,
             skipped_symbols=skipped_symbols,
             evaluated_symbols=evaluated_symbols,

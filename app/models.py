@@ -11,33 +11,24 @@ class ScanRequest(BaseModel):
                 {
                     "pattern_name": "crown_shelf_right_spike",
                     "min_age_days": 14,
-                    "max_age_days": 450,
+                    "max_age_days": 90,
                     "top_k": 10,
-                    "max_coins_to_evaluate": 10,
+                    "max_coins_to_evaluate": 20,
                     "vs_currency": "usd",
                     "include_notes": True,
-                    "symbols": ["RIVER", "SIREN"],
+                    "market_offset": 0,
+                    "market_batch_size": 20,
+                    "return_pre_filter_candidates": True,
                 },
                 {
                     "pattern_name": "crown_shelf_right_spike",
                     "min_age_days": 14,
-                    "max_age_days": 450,
+                    "max_age_days": 90,
                     "top_k": 10,
                     "max_coins_to_evaluate": 10,
                     "vs_currency": "usd",
                     "include_notes": True,
                     "coingecko_ids": ["stakestone", "river", "siren-2"],
-                },
-                {
-                    "pattern_name": "crown_shelf_right_spike",
-                    "min_age_days": 14,
-                    "max_age_days": 450,
-                    "top_k": 10,
-                    "max_coins_to_evaluate": 10,
-                    "vs_currency": "usd",
-                    "include_notes": True,
-                    "symbols": ["RIVER"],
-                    "coingecko_ids": ["siren-2"],
                 },
             ]
         }
@@ -52,15 +43,13 @@ class ScanRequest(BaseModel):
     include_notes: bool = True
     debug: bool = False
 
-    symbols: Optional[list[str]] = Field(
-        default=None,
-        description="Optional ticker symbols to resolve through CoinGecko markets list, e.g. ['RIVER', 'SIREN']",
-    )
-    coingecko_ids: Optional[list[str]] = Field(
-        default=None,
-        description="Optional direct CoinGecko asset ids to scan without symbol resolution, e.g. ['stakestone', 'river', 'siren-2']",
-    )
+    symbols: Optional[list[str]] = Field(default=None)
+    coingecko_ids: Optional[list[str]] = Field(default=None)
     exclude_symbols: Optional[list[str]] = Field(default=None)
+
+    market_offset: int = Field(default=0, ge=0)
+    market_batch_size: Optional[int] = Field(default=None, ge=1, le=500)
+    return_pre_filter_candidates: bool = True
 
 
 class MatchBreakdown(BaseModel):
@@ -113,6 +102,7 @@ class DebugSymbolInfo(BaseModel):
     distance_to_siren_breakdown: float | None = None
     distance_to_river_breakdown: float | None = None
     reference_band_passed: bool | None = None
+    pre_breakout_base_score: float | None = None
 
     raw_similarity: float | None = None
     label: str | None = None
@@ -129,6 +119,7 @@ class ScanResult(BaseModel):
     similarity: float
     raw_similarity: float
     label: str
+    label_before_final_gate: str | None = None
     stage: str
 
     structural_score: float
@@ -136,6 +127,7 @@ class ScanResult(BaseModel):
     distance_to_siren_breakdown: float
     distance_to_river_breakdown: float
     reference_band_passed: bool
+    pre_breakout_base_score: float | None = None
 
     universe_filter_status: str
     universe_filter_reason: str
@@ -165,10 +157,18 @@ class ScanResponse(BaseModel):
     evaluated_assets: list[str] = []
     skipped_assets: list[str] = []
 
+    universe_source: str = "coingecko_markets"
+    universe_total_count: int = 0
+    universe_filtered_count: int = 0
+    market_offset: int = 0
+    market_batch_size: int = 0
+    market_batch_ids: list[str] = []
+
     skip_reasons: Dict[str, str] = {}
     debug_by_symbol: Dict[str, DebugSymbolInfo] = {}
 
     results: list[ScanResult]
+    pre_filter_candidates: list[ScanResult] = []
 
 
 class ErrorResponse(BaseModel):

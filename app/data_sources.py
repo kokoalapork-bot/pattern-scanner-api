@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import asyncio
 import math
+from time import monotonic
 
 import httpx
 
@@ -71,6 +72,12 @@ STABLE_NAME_KEYWORDS = [
 DEMO_HISTORY_MAX_DAYS = 365
 
 
+CACHE_TTL_SECONDS = 300.0
+_MARKETS_CACHE: dict[tuple[str, int, int], tuple[float, list[dict[str, Any]]]] = {}
+_COIN_SNAPSHOT_CACHE: dict[tuple[str, str], tuple[float, CoinSnapshotFetchResult]] = {}
+_MARKET_CHART_CACHE: dict[tuple[str, str, str, str], tuple[float, MarketDataFetchResult]] = {}
+
+
 class CoinGeckoConfigError(RuntimeError):
     pass
 
@@ -113,6 +120,22 @@ class CoinGeckoAuth:
     api_key: str
     api_key_present: bool
 
+
+
+
+def _cache_get(cache: dict, key: tuple, ttl_seconds: float):
+    row = cache.get(key)
+    if not row:
+        return None
+    ts, value = row
+    if (monotonic() - ts) > ttl_seconds:
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(cache: dict, key: tuple, value):
+    cache[key] = (monotonic(), value)
 
 def build_coingecko_auth() -> CoinGeckoAuth:
     auth_mode = settings.coingecko_auth_mode
@@ -271,6 +294,11 @@ class CoinGeckoClient:
         pages: int = 3,
         per_page: int = 250,
     ) -> list[dict[str, Any]]:
+        cache_key = (vs_currency, int(pages), int(per_page))
+        cached = _cache_get(_MARKETS_CACHE, cache_key, CACHE_TTL_SECONDS)
+        if cached is not None:
+            return [dict(item) for item in cached]
+
         items: list[dict[str, Any]] = []
 
         for page in range(1, pages + 1):
@@ -291,7 +319,8 @@ class CoinGeckoClient:
                 raise ValueError("CoinGecko /coins/markets returned non-list payload")
             items.extend(payload)
 
-        return items
+        _cache_set(_MARKETS_CACHE, cache_key, items)
+        return [dict(item) for item in items]
 
     async def fetch_coin_snapshot_safe(self, coingecko_id: str, vs_currency: str = "usd") -> CoinSnapshotFetchResult:
         endpoint = f"/coins/{coingecko_id}"
@@ -303,6 +332,11 @@ class CoinGeckoClient:
             "developer_data": "false",
             "sparkline": "false",
         }
+
+        cache_key = (str(coingecko_id).lower(), vs_currency)
+        cached = _cache_get(_COIN_SNAPSHOT_CACHE, cache_key, CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
 
         try:
             resp = await self.client.get(endpoint, params=request_params)
@@ -350,7 +384,7 @@ class CoinGeckoClient:
                 "total_volume": total_volume,
             }
 
-            return CoinSnapshotFetchResult(
+            result = CoinSnapshotFetchResult(
                 ok=True,
                 coin=coin,
                 endpoint="/coins/{id}",
@@ -358,6 +392,8 @@ class CoinGeckoClient:
                 request_params=request_params,
                 **self.auth_debug(),
             )
+            _cache_set(_COIN_SNAPSHOT_CACHE, cache_key, result)
+            return result
 
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
@@ -478,6 +514,10 @@ class CoinGeckoClient:
             )
 
         endpoint = f"/coins/{coingecko_id}/market_chart"
+        cache_key = (str(coingecko_id).lower(), str(vs_currency).lower(), str(normalized_days), str(interval).lower())
+        cached = _cache_get(_MARKET_CHART_CACHE, cache_key, CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
         request_params = {
             "vs_currency": vs_currency,
             "days": str(normalized_days),
@@ -681,7 +721,7 @@ class CoinGeckoClient:
                 **self.auth_debug(),
             )
 
-        return MarketDataFetchResult(
+        result = MarketDataFetchResult(
             ok=True,
             chart=chart,
             endpoint="/coins/{id}/market_chart",
@@ -689,6 +729,8 @@ class CoinGeckoClient:
             request_params=request_params,
             **self.auth_debug(),
         )
+        _cache_set(_MARKET_CHART_CACHE, cache_key, result)
+        return result
 
 
 def coingecko_daily_closes(chart: dict[str, Any]) -> list[float]:

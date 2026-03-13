@@ -248,36 +248,71 @@ def classify_final_label(
     exemplar_consistency_score: float,
     reference_band_passed: bool,
     universe_filter_status: str,
-    left_structure_ok: bool,
-    pre_breakout_tail_ok: bool,
-    stage_ok: bool,
-    pre_breakout_base_score: float,
+    left_structure_ok: bool = True,
+    pre_breakout_tail_ok: bool = True,
+    stage_ok: bool = True,
+    pre_breakout_base_score: float = 50.0,
+    distance_to_siren_breakdown: float | None = None,
+    distance_to_river_breakdown: float | None = None,
 ) -> str:
     if universe_filter_status != "included_for_scoring":
         return "reject"
 
-    if structural_score < 30.0:
+    if structural_score < 28.0:
         return "reject"
 
     if not left_structure_ok:
         return "reject"
 
+    nearest_distance = min(
+        distance_to_siren_breakdown if distance_to_siren_breakdown is not None else 9.0,
+        distance_to_river_breakdown if distance_to_river_breakdown is not None else 9.0,
+    )
+
     if (
-        structural_score >= 62.0
-        and exemplar_consistency_score >= 55.0
-        and reference_band_passed
-        and pre_breakout_tail_ok
-        and stage_ok
-        and pre_breakout_base_score >= 62.0
+        structural_score >= 60.0
+        and exemplar_consistency_score >= 56.0
+        and pre_breakout_base_score >= 55.0
+        and nearest_distance <= 0.205
+        and (reference_band_passed or pre_breakout_tail_ok or stage_ok)
     ):
         return "strong match"
 
-    if structural_score >= 45.0 and exemplar_consistency_score >= 32.0 and pre_breakout_base_score >= 45.0:
+    if (
+        structural_score >= 45.0
+        and exemplar_consistency_score >= 42.0
+        and pre_breakout_base_score >= 42.0
+        and nearest_distance <= 0.285
+    ):
         if base_label == "weak-crown variant":
             return "weak-crown variant"
         return "partial match"
 
-    return "weak match"
+    if (
+        structural_score >= 36.0
+        and exemplar_consistency_score >= 38.0
+        and pre_breakout_base_score >= 34.0
+        and nearest_distance <= 0.33
+    ):
+        return "watchlist candidate"
+
+    if structural_score >= 55.0:
+        return "weak match"
+
+    return "reject"
+
+
+def should_surface_pre_filter_candidate(best: dict) -> bool:
+    nearest_distance = min(
+        float(best["distance_to_siren_breakdown"]),
+        float(best["distance_to_river_breakdown"]),
+    )
+    return (
+        float(best["raw_similarity"]) >= 42.0
+        or float(best["structural_score"]) >= 40.0
+        or float(best["exemplar_consistency_score"]) >= 48.0
+        or nearest_distance <= 0.22
+    )
 
 
 def combine_scores(structural_score: float, exemplar_consistency_score: float) -> float:
@@ -651,15 +686,15 @@ async def build_automatic_market_universe(
     client: CoinGeckoClient,
     req: ScanRequest,
     markets: list[dict],
-) -> tuple[list[dict], dict[str, DebugSymbolInfo], dict[str, str], dict[str, dict]]:
-    candidates: list[dict] = []
+) -> tuple[list[dict], dict[str, DebugSymbolInfo], dict[str, str], dict[str, dict], int, int, list[str]]:
+    all_candidates: list[dict] = []
     local_debug: dict[str, DebugSymbolInfo] = {}
     local_skip_reasons: dict[str, str] = {}
     asset_sources: dict[str, dict] = {}
 
     excluded_symbols = {s.lower() for s in req.exclude_symbols or []}
 
-    for coin in markets:
+    for coin in dedupe_candidates_by_id(markets):
         symbol = str(coin.get("symbol", "")).upper()
         coin_id = str(coin.get("id", ""))
         asset_key = make_asset_key_from_id(coin_id)
@@ -691,14 +726,30 @@ async def build_automatic_market_universe(
             local_skip_reasons[asset_key] = universe_reason
             continue
 
-        candidates.append(coin)
+        all_candidates.append(coin)
         asset_sources[coin_id.lower()] = {
             "source_type": "market_universe",
             "input_symbol": symbol,
             "input_coingecko_id": coin_id,
         }
 
-    return dedupe_candidates_by_id(candidates), local_debug, local_skip_reasons, asset_sources
+    all_candidates = dedupe_candidates_by_id(all_candidates)
+    universe_total_count = len(all_candidates)
+
+    batch_size = req.market_batch_size or req.max_coins_to_evaluate or 50
+    market_offset = max(0, int(req.market_offset))
+    sliced_candidates = all_candidates[market_offset: market_offset + batch_size]
+    market_batch_ids = [str(c.get("id", "")).lower() for c in sliced_candidates if str(c.get("id", "")).strip()]
+
+    # Keep debug compact: only selected batch + explicit exclusions.
+    selected_keys = {make_asset_key_from_id(cid) for cid in market_batch_ids}
+    local_debug = {
+        key: value
+        for key, value in local_debug.items()
+        if key in selected_keys or value.universe_filter_status != "included_for_scoring"
+    }
+
+    return sliced_candidates, local_debug, local_skip_reasons, asset_sources, universe_total_count, len(sliced_candidates), market_batch_ids
 
 
 async def scan_pattern(req: ScanRequest) -> ScanResponse:
@@ -706,6 +757,9 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         raise HTTPException(status_code=400, detail="min_age_days must be <= max_age_days")
 
     client = CoinGeckoClient()
+    universe_total_count = 0
+    market_batch_size = req.market_batch_size or req.max_coins_to_evaluate
+    market_batch_ids: list[str] = []
 
     try:
         if req.symbols or req.coingecko_ids:
@@ -717,6 +771,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 ),
             )
         else:
+            # For automatic scans, fetch a broad universe but return only a compact batch.
             pages = settings.market_universe_pages
 
         try:
@@ -813,7 +868,15 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         asset_sources = build_asset_sources(debug_by_symbol=debug_by_symbol)
 
         if not (req.symbols or req.coingecko_ids):
-            candidates, auto_debug, auto_skip_reasons, auto_asset_sources = await build_automatic_market_universe(
+            (
+                candidates,
+                auto_debug,
+                auto_skip_reasons,
+                auto_asset_sources,
+                universe_total_count,
+                market_batch_size,
+                market_batch_ids,
+            ) = await build_automatic_market_universe(
                 client=client,
                 req=req,
                 markets=markets,
@@ -821,6 +884,9 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             debug_by_symbol.update(auto_debug)
             skip_reasons.update(auto_skip_reasons)
             asset_sources.update(auto_asset_sources)
+        else:
+            market_batch_ids = [str(c.get("id", "")).lower() for c in dedupe_candidates_by_id(candidates)]
+            universe_total_count = len(market_batch_ids)
 
         candidates = dedupe_candidates_by_id(candidates)
 
@@ -828,6 +894,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         evaluated_assets: list[str] = []
         skipped_assets: list[str] = []
         results: list[ScanResult] = []
+        pre_filter_candidates: list[ScanResult] = []
 
         for coin in candidates:
             coin_id = str(coin.get("id", ""))
@@ -1036,24 +1103,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 )
                 continue
 
-            if not (req.symbols or req.coingecko_ids) and (asset_age_days < req.min_age_days or asset_age_days > req.max_age_days):
-                mark_skipped(
-                    asset_key=asset_key,
-                    coingecko_id=coin_id,
-                    reason="filtered_before_scoring",
-                    stage="filter_result",
-                    skipped_assets=skipped_assets,
-                    skip_reasons=skip_reasons,
-                    debug_by_symbol=debug_by_symbol,
-                    auth_mode=fetch.auth_mode,
-                    base_url=fetch.base_url,
-                    api_key_present=fetch.api_key_present,
-                    auth_header_name=fetch.auth_header_name,
-                    universe_filter_status="included_for_scoring",
-                    universe_filter_reason="included_for_scoring",
-                )
-                continue
-
             debug_by_symbol[asset_key] = DebugSymbolInfo(
                 input_symbol=source_meta.get("input_symbol"),
                 input_coingecko_id=source_meta.get("input_coingecko_id"),
@@ -1142,7 +1191,57 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 pre_breakout_tail_ok=bool(best["pre_breakout_tail_ok"]),
                 stage_ok=bool(best["stage_ok"]),
                 pre_breakout_base_score=float(best["pre_breakout_base_score"]),
+                distance_to_siren_breakdown=float(best["distance_to_siren_breakdown"]),
+                distance_to_river_breakdown=float(best["distance_to_river_breakdown"]),
             )
+
+            label_before_final_gate = final_label if final_label != "reject" else str(best["base_label"])
+            notes = list(best["notes"])
+            notes.append(
+                f"Structural score: {best['structural_score']} | Exemplar consistency: {best['exemplar_consistency_score']}"
+            )
+            notes.append(
+                f"Distances: siren={best['distance_to_siren_breakdown']}, river={best['distance_to_river_breakdown']}"
+            )
+            notes.append(
+                f"Pre-breakout base score: {best['pre_breakout_base_score']} | tail_ok={best['pre_breakout_tail_ok']} | left_structure_ok={best['left_structure_ok']}"
+            )
+            if not best["reference_band_passed"]:
+                notes.append("Reference band guardrail failed: candidate can still surface as watchlist/pre-filter.")
+
+            result_obj = ScanResult(
+                coingecko_id=coin_id,
+                symbol=symbol or coin_id.upper(),
+                name=name or coin_id,
+                age_days=asset_age_days,
+                market_cap_usd=float(coin.get("market_cap") or 0) if coin.get("market_cap") is not None else None,
+                volume_24h_usd=float(coin.get("total_volume") or 0) if coin.get("total_volume") is not None else None,
+                similarity=float(best["similarity"]),
+                raw_similarity=float(best["raw_similarity"]),
+                label=final_label if final_label != "reject" else "watchlist candidate",
+                label_before_final_gate=label_before_final_gate,
+                stage=str(best["stage"]),
+                structural_score=float(best["structural_score"]),
+                exemplar_consistency_score=float(best["exemplar_consistency_score"]),
+                distance_to_siren_breakdown=float(best["distance_to_siren_breakdown"]),
+                distance_to_river_breakdown=float(best["distance_to_river_breakdown"]),
+                reference_band_passed=bool(best["reference_band_passed"]),
+                pre_breakout_base_score=float(best["pre_breakout_base_score"]),
+                universe_filter_status="included_for_scoring",
+                universe_filter_reason="included_for_scoring",
+                breakdown=MatchBreakdown(**asdict(best["breakdown"])),
+                best_window=BestWindow(
+                    start_idx=int(best["best_window_start"]),
+                    end_idx=int(best["best_window_end"]),
+                    length_days=int(best["best_window_len"]),
+                    best_age_days=int(best["best_age_days"]),
+                    candidate_windows_count=int(best["candidate_windows_count"]),
+                ),
+                notes=notes if req.include_notes else [],
+            )
+
+            if req.return_pre_filter_candidates and should_surface_pre_filter_candidate(best):
+                pre_filter_candidates.append(result_obj)
 
             if final_label == "reject":
                 mark_skipped(
@@ -1175,7 +1274,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     distance_to_river_breakdown=float(best["distance_to_river_breakdown"]),
                     reference_band_passed=bool(best["reference_band_passed"]),
                     raw_similarity=float(best["raw_similarity"]),
-                    label=final_label,
+                    label="watchlist candidate" if should_surface_pre_filter_candidate(best) else "reject",
                 )
                 continue
 
@@ -1214,65 +1313,17 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 distance_to_siren_breakdown=float(best["distance_to_siren_breakdown"]),
                 distance_to_river_breakdown=float(best["distance_to_river_breakdown"]),
                 reference_band_passed=bool(best["reference_band_passed"]),
+                pre_breakout_base_score=float(best["pre_breakout_base_score"]),
                 raw_similarity=float(best["raw_similarity"]),
                 label=final_label,
             )
 
-            notes = list(best["notes"])
-            notes.append(
-                f"Structural score: {best['structural_score']} | "
-                f"Exemplar consistency: {best['exemplar_consistency_score']}"
-            )
-            notes.append(
-                f"Distances: siren={best['distance_to_siren_breakdown']}, "
-                f"river={best['distance_to_river_breakdown']}"
-            )
-            notes.append(
-                f"Pre-breakout base score: {best['pre_breakout_base_score']} | "
-                f"tail_ok={best['pre_breakout_tail_ok']} | "
-                f"left_structure_ok={best['left_structure_ok']}"
-            )
-            if not best["reference_band_passed"]:
-                notes.append("Reference band guardrail failed: cannot be promoted to strong match.")
-
-            if req.include_notes:
-                notes.append(f"Best window: {best['best_window_start']}..{best['best_window_end']}")
-                notes.append(f"Best window length: {best['best_window_len']} days")
-                notes.append(f"Raw similarity: {best['raw_similarity']}%")
-
-            results.append(
-                ScanResult(
-                    coingecko_id=coin_id,
-                    symbol=symbol or coin_id.upper(),
-                    name=name or coin_id,
-                    age_days=asset_age_days,
-                    market_cap_usd=float(coin.get("market_cap") or 0) if coin.get("market_cap") is not None else None,
-                    volume_24h_usd=float(coin.get("total_volume") or 0) if coin.get("total_volume") is not None else None,
-                    similarity=float(best["similarity"]),
-                    raw_similarity=float(best["raw_similarity"]),
-                    label=final_label,
-                    stage=str(best["stage"]),
-                    structural_score=float(best["structural_score"]),
-                    exemplar_consistency_score=float(best["exemplar_consistency_score"]),
-                    distance_to_siren_breakdown=float(best["distance_to_siren_breakdown"]),
-                    distance_to_river_breakdown=float(best["distance_to_river_breakdown"]),
-                    reference_band_passed=bool(best["reference_band_passed"]),
-                    universe_filter_status="included_for_scoring",
-                    universe_filter_reason="included_for_scoring",
-                    breakdown=MatchBreakdown(**asdict(best["breakdown"])),
-                    best_window=BestWindow(
-                        start_idx=int(best["best_window_start"]),
-                        end_idx=int(best["best_window_end"]),
-                        length_days=int(best["best_window_len"]),
-                        best_age_days=int(best["best_age_days"]),
-                        candidate_windows_count=int(best["candidate_windows_count"]),
-                    ),
-                    notes=notes if req.include_notes else [],
-                )
-            )
+            results.append(result_obj)
 
         results.sort(key=lambda x: x.similarity, reverse=True)
+        pre_filter_candidates.sort(key=lambda x: x.similarity, reverse=True)
         final_results = results[: req.top_k]
+        final_prefilter = pre_filter_candidates[: max(req.top_k * 3, req.top_k)]
 
         invalid_or_unresolved_assets = (
             [make_asset_key_from_symbol(s) for s in unresolved_symbols]
@@ -1306,9 +1357,16 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             skipped_symbols=skipped_symbols,
             evaluated_assets=evaluated_assets,
             skipped_assets=skipped_assets,
+            universe_source="coingecko_markets",
+            universe_total_count=universe_total_count or len(candidates),
+            universe_filtered_count=len(candidates),
+            market_offset=req.market_offset,
+            market_batch_size=market_batch_size or len(candidates),
+            market_batch_ids=market_batch_ids,
             skip_reasons=skip_reasons,
             debug_by_symbol=debug_by_symbol,
             results=final_results,
+            pre_filter_candidates=final_prefilter if req.return_pre_filter_candidates else [],
         )
     finally:
         await client.close()

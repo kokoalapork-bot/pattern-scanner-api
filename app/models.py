@@ -44,16 +44,29 @@ class DebugSymbolInfo(BaseModel):
     status: str = "unknown"
     stage: str = "unknown"
     reason: str | None = None
+
     endpoint: str | None = None
     http_status: int | None = None
     request_params: Dict[str, Any] | None = None
     error_message: str | None = None
+
     auth_mode: str | None = None
     base_url: str | None = None
     api_key_present: bool | None = None
     auth_header_name: str | None = None
+
+    universe_filter_status: str | None = None
+    universe_filter_reason: str | None = None
+
     candidate_windows_count: int | None = None
     best_window: Dict[str, Any] | None = None
+
+    structural_score: float | None = None
+    exemplar_consistency_score: float | None = None
+    distance_to_siren_breakdown: float | None = None
+    distance_to_river_breakdown: float | None = None
+    reference_band_passed: bool | None = None
+
     raw_similarity: float | None = None
     label: str | None = None
 
@@ -70,6 +83,15 @@ class ScanResult(BaseModel):
     raw_similarity: float
     label: str
     stage: str
+
+    structural_score: float
+    exemplar_consistency_score: float
+    distance_to_siren_breakdown: float
+    distance_to_river_breakdown: float
+    reference_band_passed: bool
+
+    universe_filter_status: str
+    universe_filter_reason: str
 
     breakdown: MatchBreakdown
     best_window: BestWindow
@@ -92,6 +114,10 @@ class ScanResponse(BaseModel):
     debug_by_symbol: Dict[str, DebugSymbolInfo] = {}
 
     results: list[ScanResult]
+
+
+class ErrorResponse(BaseModel):
+    detail: str
 
 
 class ErrorResponse(BaseModel):

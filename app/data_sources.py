@@ -47,6 +47,7 @@ class MarketDataFetchResult:
     auth_mode: str | None = None
     base_url: str | None = None
     api_key_present: bool | None = None
+    auth_header_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,7 +79,7 @@ def build_coingecko_auth() -> CoinGeckoAuth:
         if header_name != "x-cg-pro-api-key":
             raise CoinGeckoConfigError("pro mode must use x-cg-pro-api-key")
     else:
-        raise CoinGeckoConfigError("Unsupported coingecko auth mode")
+        raise CoinGeckoConfigError(f"Unsupported auth mode: {auth_mode}")
 
     return CoinGeckoAuth(
         mode=auth_mode,
@@ -92,15 +93,13 @@ def build_coingecko_auth() -> CoinGeckoAuth:
 class CoinGeckoClient:
     def __init__(self) -> None:
         self.auth = build_coingecko_auth()
-        headers = {
-            "accept": "application/json",
-            "user-agent": "crypto-pattern-scanner/1.0",
-            self.auth.header_name: self.auth.api_key,
-        }
-
         self.client = httpx.AsyncClient(
             base_url=self.auth.base_url,
-            headers=headers,
+            headers={
+                "accept": "application/json",
+                "user-agent": "crypto-pattern-scanner/1.0",
+                self.auth.header_name: self.auth.api_key,
+            },
             timeout=settings.request_timeout_seconds,
         )
 
@@ -112,6 +111,7 @@ class CoinGeckoClient:
             "auth_mode": self.auth.mode,
             "base_url": self.auth.base_url,
             "api_key_present": self.auth.api_key_present,
+            "auth_header_name": self.auth.header_name,
         }
 
     async def get_markets(
@@ -238,6 +238,12 @@ class CoinGeckoClient:
 
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
+                body_text = ""
+                try:
+                    body_text = e.response.text[:500]
+                except Exception:
+                    body_text = ""
+                error_message = str(e) if not body_text else f"{str(e)} | body={body_text}"
 
                 if status == 429:
                     if attempt < retries - 1:
@@ -246,7 +252,7 @@ class CoinGeckoClient:
                     return MarketDataFetchResult(
                         ok=False,
                         reason="rate_limited",
-                        error_message=str(e),
+                        error_message=error_message,
                         endpoint="/coins/{id}/market_chart",
                         http_status=status,
                         request_params=request_params,
@@ -257,7 +263,7 @@ class CoinGeckoClient:
                     return MarketDataFetchResult(
                         ok=False,
                         reason="history_http_401",
-                        error_message=str(e),
+                        error_message=error_message,
                         endpoint="/coins/{id}/market_chart",
                         http_status=status,
                         request_params=request_params,
@@ -268,7 +274,7 @@ class CoinGeckoClient:
                     return MarketDataFetchResult(
                         ok=False,
                         reason="history_http_403",
-                        error_message=str(e),
+                        error_message=error_message,
                         endpoint="/coins/{id}/market_chart",
                         http_status=status,
                         request_params=request_params,
@@ -279,7 +285,7 @@ class CoinGeckoClient:
                     return MarketDataFetchResult(
                         ok=False,
                         reason="history_http_404",
-                        error_message=str(e),
+                        error_message=error_message,
                         endpoint="/coins/{id}/market_chart",
                         http_status=status,
                         request_params=request_params,
@@ -293,7 +299,7 @@ class CoinGeckoClient:
                 return MarketDataFetchResult(
                     ok=False,
                     reason="history_http_error",
-                    error_message=str(e),
+                    error_message=error_message,
                     endpoint="/coins/{id}/market_chart",
                     http_status=status,
                     request_params=request_params,

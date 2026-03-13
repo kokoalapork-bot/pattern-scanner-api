@@ -1,5 +1,3 @@
-# models.py
-
 from typing import Literal, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
@@ -36,9 +34,11 @@ class BestWindow(BaseModel):
     end_idx: int
     length_days: int
     candidate_windows_count: int
+    best_age_days: int
 
 
 class DebugSymbolInfo(BaseModel):
+    input_symbol: str | None = None
     resolved: bool = False
     coingecko_id: str | None = None
     status: str = "unknown"
@@ -51,6 +51,10 @@ class DebugSymbolInfo(BaseModel):
     auth_mode: str | None = None
     base_url: str | None = None
     api_key_present: bool | None = None
+    candidate_windows_count: int | None = None
+    best_window: Dict[str, Any] | None = None
+    raw_similarity: float | None = None
+    label: str | None = None
 
 
 class ScanResult(BaseModel):

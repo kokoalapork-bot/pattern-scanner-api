@@ -1,129 +1,111 @@
 import pytest
+import httpx
 
-from app.data_sources import MarketDataFetchResult
-from app.services import scan_pattern
-from app.models import ScanRequest
-
-
-class DummyClient:
-    def __init__(self, markets, fetch_map):
-        self._markets = markets
-        self._fetch_map = fetch_map
-
-    async def close(self):
-        return None
-
-    async def get_markets(self, vs_currency="usd", pages=1, per_page=250):
-        return self._markets
-
-    async def fetch_market_chart_safe(self, coin_id: str, vs_currency="usd", days=450):
-        return self._fetch_map[coin_id]
+from app.data_sources import CoinGeckoClient, MarketDataFetchResult
 
 
-@pytest.mark.asyncio
-async def test_history_fetch_rate_limited(monkeypatch):
-    from app import services
-
-    markets = [
-        {"id": "bitcoin", "symbol": "btc", "name": "Bitcoin", "market_cap": 10_000_000, "total_volume": 1_000_000},
-    ]
-    fetch_map = {
-        "bitcoin": MarketDataFetchResult(
-            ok=False,
-            reason="rate_limited",
-            endpoint="/coins/{id}/market_chart",
-            http_status=429,
-            request_params={"vs_currency": "usd", "days": "450", "interval": "daily"},
+class DummyClient(CoinGeckoClient):
+    def __init__(self, transport: httpx.AsyncBaseTransport):
+        super().__init__()
+        self.client = httpx.AsyncClient(
+            base_url=self.auth.base_url,
+            headers={
+                "accept": "application/json",
+                self.auth.header_name: self.auth.api_key,
+            },
+            timeout=10.0,
+            transport=transport,
         )
-    }
 
-    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
 
-    req = ScanRequest(symbols=["BTC"], min_age_days=14, max_age_days=450, top_k=10)
-    resp = await scan_pattern(req)
-
-    assert resp.skip_reasons["BTC"] == "rate_limited"
-    assert resp.debug_by_symbol["BTC"].http_status == 429
-    assert resp.debug_by_symbol["BTC"].endpoint == "/coins/{id}/market_chart"
+def _prices_payload(n=40):
+    return {"prices": [[1700000000000 + i * 86400000, float(i + 1)] for i in range(n)]}
 
 
 @pytest.mark.asyncio
-async def test_history_fetch_empty(monkeypatch):
-    from app import services
+async def test_history_ok(monkeypatch):
+    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
+    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
 
-    markets = [
-        {"id": "river", "symbol": "river", "name": "River", "market_cap": 10_000_000, "total_volume": 1_000_000},
-    ]
-    fetch_map = {
-        "river": MarketDataFetchResult(
-            ok=True,
-            chart={"prices": []},
-            endpoint="/coins/{id}/market_chart",
-            request_params={"vs_currency": "usd", "days": "450", "interval": "daily"},
-        )
-    }
+    async def handler(request: httpx.Request):
+        return httpx.Response(200, json=_prices_payload(50), request=request)
 
-    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
+    client = DummyClient(httpx.MockTransport(handler))
+    result = await client.fetch_market_history("bitcoin", "usd", 450, "daily")
+    await client.close()
 
-    req = ScanRequest(symbols=["RIVER"], min_age_days=14, max_age_days=450, top_k=10)
-    resp = await scan_pattern(req)
-
-    assert resp.skip_reasons["RIVER"] == "history_empty"
+    assert result.ok is True
+    assert result.http_status == 200
 
 
 @pytest.mark.asyncio
-async def test_history_fetch_uses_resolved_coingecko_id(monkeypatch):
-    from app import services
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        (401, "history_http_401"),
+        (403, "history_http_403"),
+        (404, "history_http_404"),
+        (429, "rate_limited"),
+    ],
+)
+async def test_history_http_mapping(monkeypatch, status, reason):
+    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
+    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
 
-    markets = [
-        {"id": "siren-2", "symbol": "siren", "name": "SIREN", "market_cap": 10_000_000, "total_volume": 1_000_000},
-    ]
+    async def handler(request: httpx.Request):
+        return httpx.Response(status, json={"error": "x"}, request=request)
 
-    called_ids = []
+    client = DummyClient(httpx.MockTransport(handler))
+    result = await client.fetch_market_history("bitcoin", "usd", 450, "daily")
+    await client.close()
 
-    class DummyClient2(DummyClient):
-        async def fetch_market_chart_safe(self, coin_id: str, vs_currency="usd", days=450):
-            called_ids.append(coin_id)
-            return MarketDataFetchResult(
-                ok=False,
-                reason="history_not_found",
-                endpoint="/coins/{id}/market_chart",
-                http_status=404,
-                request_params={"vs_currency": "usd", "days": "450", "interval": "daily"},
-            )
-
-    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient2(markets, {}))
-
-    req = ScanRequest(symbols=["SIREN"], min_age_days=14, max_age_days=450, top_k=10)
-    resp = await scan_pattern(req)
-
-    assert called_ids == ["siren-2"]
-    assert resp.debug_by_symbol["SIREN"].coingecko_id == "siren-2"
+    assert result.ok is False
+    assert result.reason == reason
 
 
 @pytest.mark.asyncio
-async def test_valid_history_reaches_scoring(monkeypatch):
-    from app import services
+async def test_history_bad_schema(monkeypatch):
+    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
+    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
 
-    prices = [[1_700_000_000_000 + i * 86_400_000, 1.0 + (i % 10) * 0.01] for i in range(90)]
+    async def handler(request: httpx.Request):
+        return httpx.Response(200, json={"foo": "bar"}, request=request)
 
-    markets = [
-        {"id": "bitcoin", "symbol": "btc", "name": "Bitcoin", "market_cap": 10_000_000, "total_volume": 1_000_000},
-    ]
-    fetch_map = {
-        "bitcoin": MarketDataFetchResult(
-            ok=True,
-            chart={"prices": prices},
-            endpoint="/coins/{id}/market_chart",
-            request_params={"vs_currency": "usd", "days": "450", "interval": "daily"},
-        )
-    }
+    client = DummyClient(httpx.MockTransport(handler))
+    result = await client.fetch_market_history("bitcoin", "usd", 450, "daily")
+    await client.close()
 
-    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
+    assert result.ok is False
+    assert result.reason == "history_bad_response_schema"
 
-    req = ScanRequest(symbols=["BTC"], min_age_days=14, max_age_days=60, top_k=10)
-    resp = await scan_pattern(req)
 
-    assert resp.evaluated_count >= 1
-    assert "BTC" in resp.evaluated_symbols
-    assert resp.debug_by_symbol["BTC"].stage == "score_windows"
+@pytest.mark.asyncio
+async def test_history_empty(monkeypatch):
+    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
+    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
+
+    async def handler(request: httpx.Request):
+        return httpx.Response(200, json={"prices": []}, request=request)
+
+    client = DummyClient(httpx.MockTransport(handler))
+    result = await client.fetch_market_history("bitcoin", "usd", 450, "daily")
+    await client.close()
+
+    assert result.ok is False
+    assert result.reason == "history_empty"
+
+
+@pytest.mark.asyncio
+async def test_history_timeout(monkeypatch):
+    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
+    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
+
+    async def handler(request: httpx.Request):
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    client = DummyClient(httpx.MockTransport(handler))
+    result = await client.fetch_market_history("bitcoin", "usd", 450, "daily")
+    await client.close()
+
+    assert result.ok is False
+    assert result.reason == "timeout"

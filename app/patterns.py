@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple, Iterable
+from typing import Iterable, List, Tuple
 import math
 
 
@@ -37,7 +37,7 @@ def _smooth(xs: List[float], window: int = 5) -> List[float]:
     return out
 
 
-def _local_peaks(xs: List[float], min_prominence: float = 0.025) -> List[int]:
+def _local_peaks(xs: List[float], min_prominence: float = 0.02) -> List[int]:
     peaks: List[int] = []
     n = len(xs)
     if n < 3:
@@ -90,13 +90,13 @@ class PatternResult:
 
 class CrownShelfRightSpikeScorer:
     """
-    crown -> shelf -> right spike -> reversion to shelf
+    Паттерн:
+    crown -> shelf -> right_spike -> reversion
 
-    НОВАЯ ЛОГИКА:
-    - scorer стал мягче
-    - stage classifier определяет:
-      active / completed / forming
-    - completed должен ловить SIREN / RIVER, которые уже прошли стадию паттерна
+    Сделан мягче:
+    - crown не бинарная
+    - partial matches сохраняются
+    - SIREN / RIVER должны проходить как минимум как partial/structural
     """
 
     def __init__(self, debug: bool = False):
@@ -107,10 +107,10 @@ class CrownShelfRightSpikeScorer:
         xs = _smooth(xs, 5)
         xs = _minmax_scale(xs)
 
-        crown_zone = xs[:42]       # 0-35%
-        shelf_zone = xs[42:90]     # 35-75%
-        spike_zone = xs[90:108]    # 75-90%
-        revert_zone = xs[108:]     # 90-100%
+        crown_zone = xs[:42]       # 0–35%
+        shelf_zone = xs[42:90]     # 35–75%
+        spike_zone = xs[90:108]    # 75–90%
+        revert_zone = xs[108:]     # 90–100%
 
         crown_score, crown_notes = self._score_crown(crown_zone)
         drop_score, drop_notes = self._score_drop(crown_zone, shelf_zone)
@@ -120,32 +120,29 @@ class CrownShelfRightSpikeScorer:
         asymmetry_score, asymmetry_notes = self._score_asymmetry(crown_zone, spike_zone)
         template_shape_score, template_notes = self._score_template_shape(xs)
 
-        # Делает упор на визуальное сходство с SIREN / RIVER:
-        # полка + шпиль + возврат важнее, чем идеальная корона
         similarity = (
-            0.12 * crown_score +
-            0.12 * drop_score +
-            0.28 * shelf_score +
-            0.22 * spike_score +
-            0.18 * reversion_score +
-            0.04 * asymmetry_score +
-            0.04 * template_shape_score
+            0.18 * crown_score +
+            0.14 * drop_score +
+            0.24 * shelf_score +
+            0.20 * spike_score +
+            0.14 * reversion_score +
+            0.05 * asymmetry_score +
+            0.05 * template_shape_score
         ) * 100.0
 
         backbone = (shelf_score + spike_score + reversion_score) / 3.0
 
-        if similarity >= 62:
+        if crown_score < 0.15 and backbone >= 0.55:
+            label = "weak-crown variant"
+        elif similarity >= 65:
             label = "strong match"
         elif similarity >= 45:
             label = "partial match"
-        elif backbone >= 0.58:
-            label = "structural match"
         else:
             label = "weak match"
 
         stage, stage_notes = self._classify_stage(
             xs=xs,
-            crown_zone=crown_zone,
             shelf_zone=shelf_zone,
             spike_zone=spike_zone,
             revert_zone=revert_zone,
@@ -188,17 +185,16 @@ class CrownShelfRightSpikeScorer:
         avg = _mean(crown_zone)
         vol = _stdev(crown_zone)
 
-        # Более мягкая оценка короны
-        peak_count_score = min(1.0, len(peaks) / 2.5)
-        crest_score = max(0.0, min(1.0, (top - avg) / 0.18))
-        texture_score = max(0.0, min(1.0, vol / 0.10))
+        peak_count_score = min(1.0, len(peaks) / 3.0)
+        crest_score = max(0.0, min(1.0, (top - avg) / 0.20))
+        texture_score = max(0.0, min(1.0, vol / 0.11))
 
-        score = 0.40 * peak_count_score + 0.35 * crest_score + 0.25 * texture_score
+        score = 0.45 * peak_count_score + 0.35 * crest_score + 0.20 * texture_score
 
         notes: List[str] = []
-        if score >= 0.60:
+        if score >= 0.65:
             notes.append("Левая корона читается достаточно хорошо.")
-        elif score >= 0.28:
+        elif score >= 0.35:
             notes.append("Левая корона присутствует, но выражена мягко.")
         else:
             notes.append("Левая корона выражена слабо.")
@@ -210,10 +206,11 @@ class CrownShelfRightSpikeScorer:
         crown_high = max(crown_zone)
         shelf_mid = _mean(shelf_zone)
         drop = max(0.0, crown_high - shelf_mid)
-        score = max(0.0, min(1.0, drop / 0.28))
-        if score >= 0.50:
+        score = max(0.0, min(1.0, drop / 0.35))
+
+        if score >= 0.55:
             return score, ["Снижение из левой зоны в полку читается хорошо."]
-        if score >= 0.20:
+        if score >= 0.25:
             return score, ["Снижение из левой зоны в полку умеренное."]
         return score, ["Падение из короны в полку выражено слабо."]
 
@@ -222,12 +219,15 @@ class CrownShelfRightSpikeScorer:
             return 0.0, ["Полку не удалось оценить."]
         vol = _stdev(shelf_zone)
         slope = abs(_mean(shelf_zone[-8:]) - _mean(shelf_zone[:8])) if len(shelf_zone) >= 16 else 0.0
-        flatness = max(0.0, 1.0 - min(1.0, vol / 0.11))
-        levelness = max(0.0, 1.0 - min(1.0, slope / 0.14))
+
+        flatness = max(0.0, 1.0 - min(1.0, vol / 0.09))
+        levelness = max(0.0, 1.0 - min(1.0, slope / 0.12))
+
         score = 0.65 * flatness + 0.35 * levelness
-        if score >= 0.65:
+
+        if score >= 0.70:
             return score, ["Есть длинная и достаточно ровная средняя полка."]
-        if score >= 0.38:
+        if score >= 0.40:
             return score, ["Полка присутствует, но не совсем плоская."]
         return score, ["Средняя полка слабая или слишком шумная."]
 
@@ -237,12 +237,14 @@ class CrownShelfRightSpikeScorer:
         shelf_mid = _mean(shelf_zone)
         spike_top = max(spike_zone)
         spike_gain = max(0.0, spike_top - shelf_mid)
-        spike_narrowness = max(0.0, 1.0 - min(1.0, _stdev(spike_zone) / 0.22))
-        raw_height = max(0.0, min(1.0, spike_gain / 0.22))
-        score = 0.72 * raw_height + 0.28 * spike_narrowness
-        if score >= 0.65:
+        spike_narrowness = max(0.0, 1.0 - min(1.0, _stdev(spike_zone) / 0.18))
+        raw_height = max(0.0, min(1.0, spike_gain / 0.30))
+
+        score = 0.75 * raw_height + 0.25 * spike_narrowness
+
+        if score >= 0.75:
             return score, ["Правый шпиль выражен хорошо и визуально отделен от полки."]
-        if score >= 0.38:
+        if score >= 0.45:
             return score, ["Правый выступ есть, но он умеренный."]
         return score, ["Правый выступ слабый или размазан."]
 
@@ -254,20 +256,22 @@ class CrownShelfRightSpikeScorer:
     ) -> Tuple[float, List[str]]:
         if not shelf_zone or not spike_zone or not revert_zone:
             return 0.0, ["Возврат в полку не удалось оценить."]
+
         shelf_mid = _mean(shelf_zone)
         revert_mid = _mean(revert_zone)
         dist_to_shelf = abs(revert_mid - shelf_mid)
-        shelf_rejoin = max(0.0, 1.0 - min(1.0, dist_to_shelf / 0.16))
+        shelf_rejoin = max(0.0, 1.0 - min(1.0, dist_to_shelf / 0.12))
 
         spike_top = max(spike_zone)
         spike_excess = max(0.0, spike_top - shelf_mid)
         decay = max(0.0, spike_top - revert_mid)
-        decay_score = 0.0 if spike_excess <= 0 else max(0.0, min(1.0, decay / max(0.10, spike_excess)))
+        decay_score = 0.0 if spike_excess <= 0 else max(0.0, min(1.0, decay / max(0.12, spike_excess)))
 
-        score = 0.62 * shelf_rejoin + 0.38 * decay_score
-        if score >= 0.65:
+        score = 0.65 * shelf_rejoin + 0.35 * decay_score
+
+        if score >= 0.70:
             return score, ["После шпиля есть возврат в боковик."]
-        if score >= 0.35:
+        if score >= 0.40:
             return score, ["После шпиля возврат в полку умеренный."]
         return score, ["После шпиля возврат в полку выражен слабо."]
 
@@ -276,35 +280,38 @@ class CrownShelfRightSpikeScorer:
             return 0.0, ["Асимметрию формы не удалось оценить."]
         left_height = max(crown_zone) - min(crown_zone)
         right_height = max(spike_zone) - min(spike_zone)
+
         ratio = right_height / max(1e-9, left_height)
-        score = 1.0 - min(1.0, abs(ratio - 1.0) / 1.8)
-        if score >= 0.55:
+        score = 1.0 - min(1.0, abs(ratio - 1.0) / 1.5)
+
+        if score >= 0.60:
             return score, ["Левая и правая части формы соразмерны."]
         return score, ["Баланс левой и правой части формы средний."]
 
     def _score_template_shape(self, xs: List[float]) -> Tuple[float, List[str]]:
         if not xs:
             return 0.0, ["Силуэт не удалось оценить."]
+
         crown = _mean(xs[:30])
         shelf = _mean(xs[45:85])
         spike = max(xs[92:108]) if len(xs) >= 108 else max(xs)
         revert = _mean(xs[108:]) if len(xs) > 108 else xs[-1]
 
-        cond1 = max(0.0, min(1.0, (crown - shelf + 0.06) / 0.20))
-        cond2 = max(0.0, min(1.0, (spike - shelf) / 0.22))
-        cond3 = max(0.0, 1.0 - min(1.0, abs(revert - shelf) / 0.16))
-        score = 0.30 * cond1 + 0.35 * cond2 + 0.35 * cond3
+        cond1 = max(0.0, min(1.0, (crown - shelf + 0.08) / 0.25))
+        cond2 = max(0.0, min(1.0, (spike - shelf) / 0.30))
+        cond3 = max(0.0, 1.0 - min(1.0, abs(revert - shelf) / 0.12))
 
-        if score >= 0.58:
+        score = 0.35 * cond1 + 0.35 * cond2 + 0.30 * cond3
+
+        if score >= 0.65:
             return score, ["Общий силуэт хорошо похож на эталон."]
-        if score >= 0.35:
+        if score >= 0.40:
             return score, ["Общий силуэт умеренно похож на эталон."]
         return score, ["Силуэт заметно отклоняется от эталона."]
 
     def _classify_stage(
         self,
         xs: List[float],
-        crown_zone: List[float],
         shelf_zone: List[float],
         spike_zone: List[float],
         revert_zone: List[float],
@@ -313,14 +320,6 @@ class CrownShelfRightSpikeScorer:
         spike_score: float,
         reversion_score: float,
     ) -> Tuple[str, List[str]]:
-        """
-        active:
-            паттерн актуален, правый блок еще живой, но не полностью умер
-        completed:
-            паттерн уже отыгран, как SIREN / RIVER
-        forming:
-            еще формируется, не завершен
-        """
         notes: List[str] = []
 
         shelf_mid = _mean(shelf_zone) if shelf_zone else 0.0
@@ -328,38 +327,29 @@ class CrownShelfRightSpikeScorer:
         revert_mid = _mean(revert_zone) if revert_zone else shelf_mid
         last_tail = _mean(xs[-8:]) if len(xs) >= 8 else xs[-1]
 
-        spike_gain = max(0.0, spike_top - shelf_mid)
-        revert_distance = abs(revert_mid - shelf_mid)
         tail_distance = abs(last_tail - shelf_mid)
 
-        # completed:
-        # был шпиль, потом возврат и стабилизация около полки
         if spike_score >= 0.45 and reversion_score >= 0.55 and tail_distance <= 0.10:
             notes.append("Стадия: паттерн уже в основном отыгран.")
             return "completed", notes
 
-        # active:
-        # шпиль есть, возврат еще не до конца завершен, структура еще живая
         if spike_score >= 0.45 and similarity >= 45 and tail_distance > 0.10:
             notes.append("Стадия: паттерн еще активен и потенциально торгуем.")
             return "active", notes
 
-        # forming:
-        # есть зачатки полки/структуры, но правый блок еще не оформлен
-        if shelf_score >= 0.45 and spike_gain < 0.10:
+        if shelf_score >= 0.45 and spike_score < 0.30:
             notes.append("Стадия: паттерн еще формируется.")
             return "forming", notes
 
-        # fallback
         if reversion_score >= 0.50:
             notes.append("Стадия ближе к завершенной.")
             return "completed", notes
 
-        notes.append("Стадия ближе к активной/не до конца завершенной.")
+        notes.append("Стадия ближе к активной.")
         return "active", notes
 
 
 def score_crown_shelf_right_spike(close: Iterable[float]):
     scorer = CrownShelfRightSpikeScorer(debug=False)
     result = scorer.score(list(close))
-    return result.similarity, result.breakdown, [f"Stage: {result.stage}."] + result.notes
+    return result

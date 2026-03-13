@@ -1,10 +1,48 @@
 from typing import Literal, Optional, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 PatternName = Literal["crown_shelf_right_spike"]
 
 
 class ScanRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "pattern_name": "crown_shelf_right_spike",
+                    "min_age_days": 14,
+                    "max_age_days": 450,
+                    "top_k": 10,
+                    "max_coins_to_evaluate": 10,
+                    "vs_currency": "usd",
+                    "include_notes": True,
+                    "symbols": ["RIVER", "SIREN"],
+                },
+                {
+                    "pattern_name": "crown_shelf_right_spike",
+                    "min_age_days": 14,
+                    "max_age_days": 450,
+                    "top_k": 10,
+                    "max_coins_to_evaluate": 10,
+                    "vs_currency": "usd",
+                    "include_notes": True,
+                    "coingecko_ids": ["stakestone", "river", "siren-2"],
+                },
+                {
+                    "pattern_name": "crown_shelf_right_spike",
+                    "min_age_days": 14,
+                    "max_age_days": 450,
+                    "top_k": 10,
+                    "max_coins_to_evaluate": 10,
+                    "vs_currency": "usd",
+                    "include_notes": True,
+                    "symbols": ["RIVER"],
+                    "coingecko_ids": ["siren-2"],
+                },
+            ]
+        }
+    )
+
     pattern_name: PatternName = "crown_shelf_right_spike"
     min_age_days: int = Field(default=14, ge=1, le=5000)
     max_age_days: int = Field(default=450, ge=1, le=5000)
@@ -14,9 +52,15 @@ class ScanRequest(BaseModel):
     include_notes: bool = True
     debug: bool = False
 
-    symbols: Optional[list[str]] = None
-    coingecko_ids: Optional[list[str]] = None
-    exclude_symbols: Optional[list[str]] = None
+    symbols: Optional[list[str]] = Field(
+        default=None,
+        description="Optional ticker symbols to resolve through CoinGecko markets list, e.g. ['RIVER', 'SIREN']",
+    )
+    coingecko_ids: Optional[list[str]] = Field(
+        default=None,
+        description="Optional direct CoinGecko asset ids to scan without symbol resolution, e.g. ['stakestone', 'river', 'siren-2']",
+    )
+    exclude_symbols: Optional[list[str]] = Field(default=None)
 
 
 class MatchBreakdown(BaseModel):
@@ -40,7 +84,7 @@ class BestWindow(BaseModel):
 class DebugSymbolInfo(BaseModel):
     input_symbol: str | None = None
     input_coingecko_id: str | None = None
-    source_type: str | None = None  # "symbol" | "coingecko_id" | "mixed"
+    source_type: str | None = None
 
     resolved: bool = False
     coingecko_id: str | None = None

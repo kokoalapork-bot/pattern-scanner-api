@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -31,9 +32,19 @@ TOKENIZED_STOCK_KEYWORDS = [
 ]
 
 
+@dataclass
+class MarketDataFetchResult:
+    ok: bool
+    reason: str | None = None
+    chart: dict[str, Any] | None = None
+    error_message: str | None = None
+
+
 class CoinGeckoClient:
     def __init__(self) -> None:
         headers = {"accept": "application/json"}
+
+        # Для demo key нужен x-cg-demo-api-key
         if settings.coingecko_api_key:
             headers["x-cg-demo-api-key"] = settings.coingecko_api_key
 
@@ -66,21 +77,6 @@ class CoinGeckoClient:
 
         return items
 
-    async def get_coin(self, coin_id: str) -> dict[str, Any]:
-        resp = await self.client.get(
-            f"/coins/{coin_id}",
-            params={
-                "localization": "false",
-                "tickers": "false",
-                "market_data": "false",
-                "community_data": "false",
-                "developer_data": "false",
-                "sparkline": "false",
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()
-
     async def get_market_chart(self, coin_id: str, vs_currency: str = "usd", days: int = 450) -> dict[str, Any]:
         resp = await self.client.get(
             f"/coins/{coin_id}/market_chart",
@@ -93,25 +89,36 @@ class CoinGeckoClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def fetch_market_chart_safe(self, coin_id: str, vs_currency: str = "usd", days: int = 450) -> MarketDataFetchResult:
+        if not coin_id:
+            return MarketDataFetchResult(ok=False, reason="coingecko_id_missing")
 
-def parse_date(value: str | None):
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
-    except ValueError:
-        return None
+        try:
+            chart = await self.get_market_chart(coin_id=coin_id, vs_currency=vs_currency, days=days)
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if code == 429:
+                return MarketDataFetchResult(ok=False, reason="rate_limited", error_message=str(e))
+            if code == 404:
+                return MarketDataFetchResult(ok=False, reason="history_fetch_failed", error_message=str(e))
+            return MarketDataFetchResult(ok=False, reason="history_fetch_failed", error_message=str(e))
+        except httpx.RequestError as e:
+            return MarketDataFetchResult(ok=False, reason="network_error", error_message=str(e))
+        except Exception as e:
+            return MarketDataFetchResult(ok=False, reason="market_data_fetch_failed", error_message=f"{type(e).__name__}: {e}")
 
+        if not isinstance(chart, dict):
+            return MarketDataFetchResult(ok=False, reason="bad_response_schema", error_message="chart is not dict")
 
-def age_in_days(genesis_date, fallback_from_history_ts_ms=None):
-    if genesis_date is None and fallback_from_history_ts_ms is None:
-        return None
+        prices = chart.get("prices")
+        if prices is None:
+            return MarketDataFetchResult(ok=False, reason="bad_response_schema", error_message="missing prices")
+        if not isinstance(prices, list):
+            return MarketDataFetchResult(ok=False, reason="bad_response_schema", error_message="prices is not list")
+        if len(prices) == 0:
+            return MarketDataFetchResult(ok=False, reason="empty_history", error_message="empty prices")
 
-    if genesis_date is None:
-        genesis_date = datetime.fromtimestamp(fallback_from_history_ts_ms / 1000, tz=timezone.utc)
-
-    now = datetime.now(timezone.utc)
-    return max(0, (now - genesis_date).days)
+        return MarketDataFetchResult(ok=True, chart=chart)
 
 
 def looks_like_stable(symbol: str, name: str) -> bool:
@@ -130,12 +137,21 @@ def coingecko_daily_closes(chart: dict[str, Any]) -> list[float]:
     closes: list[float] = []
     seen_days: set[str] = set()
 
-    for ts_ms, price in prices:
-        day_key = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    for item in prices:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+
+        ts_ms, price = item[0], item[1]
+        try:
+            day_key = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            price_f = float(price)
+        except Exception:
+            continue
+
         if day_key in seen_days:
-            closes[-1] = float(price)
+            closes[-1] = price_f
         else:
             seen_days.add(day_key)
-            closes.append(float(price))
+            closes.append(price_f)
 
     return closes

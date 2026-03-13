@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from .config import settings
 from .data_sources import (
     CoinGeckoClient,
+    DEMO_HISTORY_MAX_DAYS,
     coingecko_daily_closes,
     looks_like_stable,
     looks_like_tokenized_stock,
@@ -41,7 +42,7 @@ def age_from_chart_days(chart: dict) -> int | None:
 
 
 def generate_window_lengths(min_age_days: int, max_age_days: int) -> list[int]:
-    candidates = [30, 45, 60, 75, 90, 120, 150, 180, 210, 240, 300, 360, 420, 450]
+    candidates = [30, 45, 60, 75, 90, 120, 150, 180, 210, 240, 300, 360]
     out = [w for w in candidates if min_age_days <= w <= max_age_days]
     if not out:
         out = [max(30, min(max_age_days, 60))]
@@ -407,7 +408,37 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 )
                 continue
 
-            history_days = min(450, req.max_age_days)
+            requested_history_days = min(450, req.max_age_days)
+            effective_history_days, days_capped = client.normalize_history_days(requested_history_days)
+
+            if client.auth.mode == "demo" and requested_history_days > DEMO_HISTORY_MAX_DAYS and explicit_mode:
+                mark_skipped(
+                    symbol=symbol,
+                    coingecko_id=coin_id,
+                    reason="history_range_exceeds_plan_limit",
+                    stage="fetch_market_data",
+                    skipped_symbols=skipped_symbols,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
+                    endpoint="/coins/{id}/market_chart",
+                    request_params={
+                        "vs_currency": req.vs_currency,
+                        "days": str(effective_history_days),
+                        "interval": "daily",
+                        "requested_days": str(requested_history_days),
+                        "plan_limit_days": DEMO_HISTORY_MAX_DAYS,
+                        "days_capped_by_plan": True,
+                    },
+                    error_message=(
+                        f"Demo plan supports up to {DEMO_HISTORY_MAX_DAYS} days for this history fetch, "
+                        f"but request asked for {requested_history_days} days."
+                    ),
+                    auth_mode=client.auth.mode,
+                    base_url=client.auth.base_url,
+                    api_key_present=client.auth.api_key_present,
+                    auth_header_name=client.auth.header_name,
+                )
+                continue
 
             debug_by_symbol[symbol] = DebugSymbolInfo(
                 input_symbol=symbol,
@@ -419,9 +450,16 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 endpoint="/coins/{id}/market_chart",
                 request_params={
                     "vs_currency": req.vs_currency,
-                    "days": str(history_days),
+                    "days": str(effective_history_days),
                     "interval": "daily",
+                    "requested_days": str(requested_history_days),
+                    "plan_limit_days": DEMO_HISTORY_MAX_DAYS if client.auth.mode == "demo" else None,
+                    "days_capped_by_plan": days_capped,
                 },
+                error_message=(
+                    f"Requested range was capped to {effective_history_days} days by plan limits."
+                    if days_capped else None
+                ),
                 auth_mode=client.auth.mode,
                 base_url=client.auth.base_url,
                 api_key_present=client.auth.api_key_present,
@@ -431,7 +469,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             fetch = await client.fetch_market_history(
                 coingecko_id=coin_id,
                 vs_currency=req.vs_currency,
-                days=history_days,
+                days=requested_history_days,
                 interval="daily",
             )
 
@@ -545,7 +583,10 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 endpoint=fetch.endpoint,
                 http_status=200,
                 request_params=fetch.request_params,
-                error_message=None,
+                error_message=(
+                    f"Requested range was capped to {effective_history_days} days by plan limits."
+                    if fetch.request_params and fetch.request_params.get("days_capped_by_plan") else None
+                ),
                 auth_mode=fetch.auth_mode,
                 base_url=fetch.base_url,
                 api_key_present=fetch.api_key_present,
@@ -553,7 +594,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             )
 
             try:
-                best = find_best_window(closes, req.min_age_days, req.max_age_days)
+                best = find_best_window(closes, req.min_age_days, min(req.max_age_days, len(closes)))
             except ScoringError as e:
                 mark_skipped(
                     symbol=symbol,
@@ -614,7 +655,10 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                 endpoint=fetch.endpoint,
                 http_status=200,
                 request_params=fetch.request_params,
-                error_message=None,
+                error_message=(
+                    f"Requested range was capped to {effective_history_days} days by plan limits."
+                    if fetch.request_params and fetch.request_params.get("days_capped_by_plan") else None
+                ),
                 auth_mode=fetch.auth_mode,
                 base_url=fetch.base_url,
                 api_key_present=fetch.api_key_present,
@@ -631,12 +675,16 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             )
 
             notes = list(best["notes"])
+            if fetch.request_params and fetch.request_params.get("days_capped_by_plan"):
+                notes.append(
+                    f"History range was capped by {client.auth.mode} plan: "
+                    f"requested {requested_history_days}d, used {effective_history_days}d."
+                )
+
             if req.include_notes:
                 notes.append(f"Best window: {best['best_window_start']}..{best['best_window_end']}")
                 notes.append(f"Best window length: {best['best_window_len']} days")
                 notes.append(f"Raw similarity: {best['raw_similarity']}%")
-            else:
-                notes = []
 
             results.append(
                 ScanResult(
@@ -658,7 +706,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                         best_age_days=int(best["best_age_days"]),
                         candidate_windows_count=int(best["candidate_windows_count"]),
                     ),
-                    notes=notes,
+                    notes=notes if req.include_notes else [],
                 )
             )
 

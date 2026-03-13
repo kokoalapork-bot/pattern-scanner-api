@@ -2,14 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import asyncio
 
 import httpx
 
 from .config import settings
-
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 STABLE_SYMBOLS = {
     "usdt", "usdc", "dai", "fdusd", "tusd", "gusd", "frax", "frxusd", "usdh", "dusd", "usdon", "fidd"
@@ -33,6 +31,10 @@ TOKENIZED_STOCK_KEYWORDS = [
 ]
 
 
+class CoinGeckoConfigError(RuntimeError):
+    pass
+
+
 @dataclass
 class MarketDataFetchResult:
     ok: bool
@@ -47,22 +49,59 @@ class MarketDataFetchResult:
     api_key_present: bool | None = None
 
 
+@dataclass(frozen=True)
+class CoinGeckoAuth:
+    mode: str
+    base_url: str
+    header_name: str
+    api_key: str
+    api_key_present: bool
+
+
+def build_coingecko_auth() -> CoinGeckoAuth:
+    auth_mode = settings.coingecko_auth_mode
+    api_key = settings.coingecko_api_key.strip()
+    base_url = settings.coingecko_effective_base_url.rstrip("/")
+    header_name = settings.coingecko_header_name
+
+    if not api_key:
+        raise CoinGeckoConfigError("COINGECKO_API_KEY is missing or blank")
+
+    if auth_mode == "demo":
+        if "pro-api.coingecko.com" in base_url:
+            raise CoinGeckoConfigError("demo mode cannot use pro-api base URL")
+        if header_name != "x-cg-demo-api-key":
+            raise CoinGeckoConfigError("demo mode must use x-cg-demo-api-key")
+    elif auth_mode == "pro":
+        if "pro-api.coingecko.com" not in base_url:
+            raise CoinGeckoConfigError("pro mode must use pro-api base URL")
+        if header_name != "x-cg-pro-api-key":
+            raise CoinGeckoConfigError("pro mode must use x-cg-pro-api-key")
+    else:
+        raise CoinGeckoConfigError("Unsupported coingecko auth mode")
+
+    return CoinGeckoAuth(
+        mode=auth_mode,
+        base_url=base_url,
+        header_name=header_name,
+        api_key=api_key,
+        api_key_present=True,
+    )
+
+
 class CoinGeckoClient:
     def __init__(self) -> None:
-        headers = {"accept": "application/json"}
-
-        api_key = str(getattr(settings, "coingecko_api_key", "") or "").strip()
-        if api_key:
-            headers["x-cg-demo-api-key"] = api_key
-
-        self.auth_mode = "demo"
-        self.base_url = COINGECKO_BASE
-        self.api_key_present = bool(api_key)
+        self.auth = build_coingecko_auth()
+        headers = {
+            "accept": "application/json",
+            "user-agent": "crypto-pattern-scanner/1.0",
+            self.auth.header_name: self.auth.api_key,
+        }
 
         self.client = httpx.AsyncClient(
-            base_url=self.base_url,
+            base_url=self.auth.base_url,
             headers=headers,
-            timeout=30.0,
+            timeout=settings.request_timeout_seconds,
         )
 
     async def close(self) -> None:
@@ -70,9 +109,9 @@ class CoinGeckoClient:
 
     def auth_debug(self) -> dict[str, Any]:
         return {
-            "auth_mode": self.auth_mode,
-            "base_url": self.base_url,
-            "api_key_present": self.api_key_present,
+            "auth_mode": self.auth.mode,
+            "base_url": self.auth.base_url,
+            "api_key_present": self.auth.api_key_present,
         }
 
     async def get_markets(
@@ -96,222 +135,211 @@ class CoinGeckoClient:
                 },
             )
             resp.raise_for_status()
-            items.extend(resp.json())
+            payload = resp.json()
+            if not isinstance(payload, list):
+                raise ValueError("CoinGecko /coins/markets returned non-list payload")
+            items.extend(payload)
 
         return items
 
-    async def get_market_chart(
+    async def fetch_market_history(
         self,
-        coin_id: str,
+        coingecko_id: str,
         vs_currency: str = "usd",
         days: int | str = 450,
-    ) -> dict[str, Any]:
-        endpoint = f"/coins/{coin_id}/market_chart"
-        params = {
-            "vs_currency": vs_currency,
-            "days": str(days),
-            "interval": "daily",
-        }
-        resp = await self.client.get(endpoint, params=params)
-        resp.raise_for_status()
-        return resp.json()
-
-    async def fetch_market_chart_safe(
-        self,
-        coin_id: str,
-        vs_currency: str = "usd",
-        days: int | str = 450,
+        interval: str = "daily",
     ) -> MarketDataFetchResult:
-        if not coin_id:
+        if not coingecko_id:
             return MarketDataFetchResult(
                 ok=False,
                 reason="coingecko_id_missing",
                 endpoint="/coins/{id}/market_chart",
-                request_params={"vs_currency": vs_currency, "days": str(days), "interval": "daily"},
-                auth_mode=self.auth_mode,
-                base_url=self.base_url,
-                api_key_present=self.api_key_present,
+                request_params={"vs_currency": vs_currency, "days": str(days), "interval": interval},
+                **self.auth_debug(),
             )
 
-        endpoint = f"/coins/{coin_id}/market_chart"
-        params = {
+        endpoint = f"/coins/{coingecko_id}/market_chart"
+        request_params = {
             "vs_currency": vs_currency,
             "days": str(days),
-            "interval": "daily",
+            "interval": interval,
         }
 
-        retries = 3
-        backoffs = [0.8, 1.6, 3.2]
-        chart: dict[str, Any] | None = None
+        retries = max(1, settings.history_retry_count)
+        backoff_base = max(0.1, settings.history_backoff_base_seconds)
+        chart: Optional[dict[str, Any]] = None
 
         for attempt in range(retries):
             try:
-                resp = await self.client.get(endpoint, params=params)
+                resp = await self.client.get(endpoint, params=request_params)
                 resp.raise_for_status()
-                chart = resp.json()
+                payload = resp.json()
+
+                if not isinstance(payload, dict):
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_bad_response_schema",
+                        error_message=f"chart is not a dict: {type(payload).__name__}",
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=200,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                prices = payload.get("prices")
+                if prices is None:
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_bad_response_schema",
+                        error_message="missing 'prices' field",
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=200,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                if not isinstance(prices, list):
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_bad_response_schema",
+                        error_message="'prices' is not a list",
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=200,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                if len(prices) == 0:
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_empty",
+                        error_message="prices list is empty",
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=200,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                chart = payload
                 break
 
-            except httpx.HTTPStatusError as e:
-                code = e.response.status_code
+            except httpx.TimeoutException as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(backoff_base * (2 ** attempt))
+                    continue
+                return MarketDataFetchResult(
+                    ok=False,
+                    reason="timeout",
+                    error_message=str(e),
+                    endpoint="/coins/{id}/market_chart",
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
 
-                if code == 429:
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+
+                if status == 429:
                     if attempt < retries - 1:
-                        await asyncio.sleep(backoffs[attempt])
+                        await asyncio.sleep(backoff_base * (2 ** attempt))
                         continue
                     return MarketDataFetchResult(
                         ok=False,
                         reason="rate_limited",
                         error_message=str(e),
                         endpoint="/coins/{id}/market_chart",
-                        http_status=code,
-                        request_params=params,
-                        auth_mode=self.auth_mode,
-                        base_url=self.base_url,
-                        api_key_present=self.api_key_present,
+                        http_status=status,
+                        request_params=request_params,
+                        **self.auth_debug(),
                     )
 
-                if code == 401:
+                if status == 401:
                     return MarketDataFetchResult(
                         ok=False,
                         reason="history_http_401",
                         error_message=str(e),
                         endpoint="/coins/{id}/market_chart",
-                        http_status=code,
-                        request_params=params,
-                        auth_mode=self.auth_mode,
-                        base_url=self.base_url,
-                        api_key_present=self.api_key_present,
+                        http_status=status,
+                        request_params=request_params,
+                        **self.auth_debug(),
                     )
 
-                if code == 403:
+                if status == 403:
                     return MarketDataFetchResult(
                         ok=False,
                         reason="history_http_403",
                         error_message=str(e),
                         endpoint="/coins/{id}/market_chart",
-                        http_status=code,
-                        request_params=params,
-                        auth_mode=self.auth_mode,
-                        base_url=self.base_url,
-                        api_key_present=self.api_key_present,
+                        http_status=status,
+                        request_params=request_params,
+                        **self.auth_debug(),
                     )
 
-                if code == 404:
+                if status == 404:
                     return MarketDataFetchResult(
                         ok=False,
                         reason="history_http_404",
                         error_message=str(e),
                         endpoint="/coins/{id}/market_chart",
-                        http_status=code,
-                        request_params=params,
-                        auth_mode=self.auth_mode,
-                        base_url=self.base_url,
-                        api_key_present=self.api_key_present,
+                        http_status=status,
+                        request_params=request_params,
+                        **self.auth_debug(),
                     )
+
+                if 500 <= status <= 599 and attempt < retries - 1:
+                    await asyncio.sleep(backoff_base * (2 ** attempt))
+                    continue
 
                 return MarketDataFetchResult(
                     ok=False,
                     reason="history_http_error",
                     error_message=str(e),
                     endpoint="/coins/{id}/market_chart",
-                    http_status=code,
-                    request_params=params,
-                    auth_mode=self.auth_mode,
-                    base_url=self.base_url,
-                    api_key_present=self.api_key_present,
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
                 )
 
             except httpx.RequestError as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(backoff_base * (2 ** attempt))
+                    continue
                 return MarketDataFetchResult(
                     ok=False,
                     reason="network_error",
                     error_message=str(e),
                     endpoint="/coins/{id}/market_chart",
-                    request_params=params,
-                    auth_mode=self.auth_mode,
-                    base_url=self.base_url,
-                    api_key_present=self.api_key_present,
+                    request_params=request_params,
+                    **self.auth_debug(),
                 )
+
             except Exception as e:
                 return MarketDataFetchResult(
                     ok=False,
                     reason="history_fetch_failed",
                     error_message=f"{type(e).__name__}: {e}",
                     endpoint="/coins/{id}/market_chart",
-                    request_params=params,
-                    auth_mode=self.auth_mode,
-                    base_url=self.base_url,
-                    api_key_present=self.api_key_present,
+                    request_params=request_params,
+                    **self.auth_debug(),
                 )
-        else:
+
+        if chart is None:
             return MarketDataFetchResult(
                 ok=False,
                 reason="history_fetch_failed",
                 error_message="retry loop exhausted unexpectedly",
                 endpoint="/coins/{id}/market_chart",
-                request_params=params,
-                auth_mode=self.auth_mode,
-                base_url=self.base_url,
-                api_key_present=self.api_key_present,
-            )
-
-        if not isinstance(chart, dict):
-            return MarketDataFetchResult(
-                ok=False,
-                reason="history_bad_response_schema",
-                error_message="chart is not a dict",
-                endpoint="/coins/{id}/market_chart",
-                request_params=params,
-                auth_mode=self.auth_mode,
-                base_url=self.base_url,
-                api_key_present=self.api_key_present,
-            )
-
-        prices = chart.get("prices")
-        if prices is None:
-            return MarketDataFetchResult(
-                ok=False,
-                reason="history_bad_response_schema",
-                error_message="missing 'prices' field",
-                endpoint="/coins/{id}/market_chart",
-                request_params=params,
-                auth_mode=self.auth_mode,
-                base_url=self.base_url,
-                api_key_present=self.api_key_present,
-            )
-
-        if not isinstance(prices, list):
-            return MarketDataFetchResult(
-                ok=False,
-                reason="history_bad_response_schema",
-                error_message="'prices' is not a list",
-                endpoint="/coins/{id}/market_chart",
-                request_params=params,
-                auth_mode=self.auth_mode,
-                base_url=self.base_url,
-                api_key_present=self.api_key_present,
-            )
-
-        if len(prices) == 0:
-            return MarketDataFetchResult(
-                ok=False,
-                reason="history_empty",
-                error_message="prices list is empty",
-                endpoint="/coins/{id}/market_chart",
-                request_params=params,
-                auth_mode=self.auth_mode,
-                base_url=self.base_url,
-                api_key_present=self.api_key_present,
+                request_params=request_params,
+                **self.auth_debug(),
             )
 
         return MarketDataFetchResult(
             ok=True,
             chart=chart,
             endpoint="/coins/{id}/market_chart",
-            request_params=params,
-            auth_mode=self.auth_mode,
-            base_url=self.base_url,
-            api_key_present=self.api_key_present,
+            http_status=200,
+            request_params=request_params,
+            **self.auth_debug(),
         )
 
 

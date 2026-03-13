@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -56,21 +56,24 @@ def iter_windows(closes: list[float], min_age_days: int, max_age_days: int):
 
         step = max(3, w // 8)
         yielded_last = False
+        count = 0
 
         for end in range(w, n + 1, step):
             start = end - w
+            count += 1
             yield closes[start:end], w, start, end, n
             if end == n:
                 yielded_last = True
 
         if not yielded_last:
+            count += 1
             yield closes[n - w:n], w, n - w, n, n
 
 
 def position_bonus(start_idx: int, end_idx: int, total_len: int) -> float:
     """
-    Хотим ловить окно в середине или ближе к концу паттерна,
-    но не совсем в самом хвосте графика.
+    Ищем окно ближе к середине / правой части паттерна,
+    но не в самом хвосте графика.
     """
     if total_len <= 0:
         return 0.0
@@ -104,22 +107,20 @@ def position_bonus(start_idx: int, end_idx: int, total_len: int) -> float:
 def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
     best_effective = -1.0
     best = None
+    candidate_windows_count = 0
 
     for window_closes, window_len, start_idx, end_idx, total_len in iter_windows(
         closes, min_age_days, max_age_days
     ):
+        candidate_windows_count += 1
+
         try:
             result = score_crown_shelf_right_spike(window_closes)
         except Exception:
             continue
 
         pos = position_bonus(start_idx, end_idx, total_len)
-
-        # raw similarity от scorer-а
         raw_similarity = float(result.similarity)
-
-        # торговая поправка:
-        # не убиваем score, но слегка штрафуем окна в самом хвосте
         effective_similarity = raw_similarity * (0.72 + 0.28 * pos)
 
         if (total_len - end_idx) <= 1:
@@ -137,6 +138,7 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
                 "best_window_len": window_len,
                 "best_window_start": start_idx,
                 "best_window_end": end_idx,
+                "candidate_windows_count": candidate_windows_count,
             }
 
     return best
@@ -156,16 +158,11 @@ def resolve_requested_coins(
     markets: list[dict],
     symbols: Optional[list[str]],
     coingecko_ids: Optional[list[str]],
-) -> tuple[list[dict], list[str], list[str]]:
-    """
-    Возвращает:
-    - resolved coin objects
-    - resolved_symbols
-    - unresolved_symbols
-    """
+) -> tuple[list[dict], list[str], list[str], dict[str, str]]:
     resolved: list[dict] = []
     resolved_symbols: list[str] = []
     unresolved_symbols: list[str] = []
+    skip_reasons: dict[str, str] = {}
 
     by_id = {str(c.get("id")): c for c in markets}
     by_symbol = build_symbol_index(markets)
@@ -176,15 +173,16 @@ def resolve_requested_coins(
             if coin:
                 resolved.append(coin)
                 resolved_symbols.append(str(coin.get("symbol", "")).upper())
-        # unresolved для ids тут не выводим отдельным полем, не просили в schema
-        return resolved, resolved_symbols, unresolved_symbols
+            else:
+                unresolved_symbols.append(cid)
+                skip_reasons[cid] = "unresolved_symbol"
+        return resolved, resolved_symbols, unresolved_symbols, skip_reasons
 
     if symbols:
         for sym in symbols:
             key = sym.lower()
             matches = by_symbol.get(key, [])
             if matches:
-                # если по символу несколько монет — берем самую крупную
                 chosen = sorted(
                     matches,
                     key=lambda x: float(x.get("market_cap") or 0),
@@ -194,8 +192,15 @@ def resolve_requested_coins(
                 resolved_symbols.append(sym.upper())
             else:
                 unresolved_symbols.append(sym.upper())
+                skip_reasons[sym.upper()] = "unresolved_symbol"
 
-    return resolved, resolved_symbols, unresolved_symbols
+    return resolved, resolved_symbols, unresolved_symbols, skip_reasons
+
+
+def mark_skipped(symbol: str, reason: str, skipped_symbols: list[str], skip_reasons: dict[str, str]):
+    if symbol not in skipped_symbols:
+        skipped_symbols.append(symbol)
+    skip_reasons[symbol] = reason
 
 
 async def scan_pattern(req: ScanRequest) -> ScanResponse:
@@ -224,13 +229,15 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         unresolved_symbols: list[str] = []
         evaluated_symbols: list[str] = []
         skipped_symbols: list[str] = []
+        skip_reasons: dict[str, str] = {}
 
         if explicit_mode:
-            candidates, resolved_symbols, unresolved_symbols = resolve_requested_coins(
+            candidates, resolved_symbols, unresolved_symbols, initial_skip_reasons = resolve_requested_coins(
                 markets=markets,
                 symbols=req.symbols,
                 coingecko_ids=req.coingecko_ids,
             )
+            skip_reasons.update(initial_skip_reasons)
         else:
             candidates = []
             excluded_symbols = {s.lower() for s in req.exclude_symbols or []}
@@ -255,7 +262,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     continue
 
                 candidates.append(coin)
-
                 if len(candidates) >= req.max_coins_to_evaluate:
                     break
 
@@ -273,35 +279,40 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                     days=min(450, req.max_age_days if not explicit_mode else 450),
                 )
             except httpx.HTTPStatusError:
-                skipped_symbols.append(symbol)
+                mark_skipped(symbol, "market_data_fetch_failed", skipped_symbols, skip_reasons)
                 continue
             except httpx.HTTPError:
-                skipped_symbols.append(symbol)
+                mark_skipped(symbol, "market_data_fetch_failed", skipped_symbols, skip_reasons)
                 continue
             except Exception:
-                skipped_symbols.append(symbol)
+                mark_skipped(symbol, "market_data_fetch_failed", skipped_symbols, skip_reasons)
                 continue
 
             closes = coingecko_daily_closes(chart)
             if len(closes) < 30:
-                skipped_symbols.append(symbol)
+                mark_skipped(symbol, "insufficient_history", skipped_symbols, skip_reasons)
                 continue
 
             asset_age_days = age_from_chart_days(chart)
             if asset_age_days is None:
-                skipped_symbols.append(symbol)
+                mark_skipped(symbol, "insufficient_history", skipped_symbols, skip_reasons)
                 continue
 
-            # Для рыночного скана фильтр возраста актива сохраняем.
-            # Для explicit-mode не режем актив до поиска лучшего окна.
+            # Для broad market scan фильтр возраста актива сохраняем.
+            # Для explicit_mode не режем актив до поиска лучшего окна.
             if not explicit_mode:
                 if asset_age_days < req.min_age_days or asset_age_days > req.max_age_days:
-                    skipped_symbols.append(symbol)
+                    mark_skipped(symbol, "filtered_before_scoring", skipped_symbols, skip_reasons)
                     continue
 
-            best = find_best_window(closes, req.min_age_days, req.max_age_days)
+            try:
+                best = find_best_window(closes, req.min_age_days, req.max_age_days)
+            except Exception:
+                mark_skipped(symbol, "window_generation_failed", skipped_symbols, skip_reasons)
+                continue
+
             if best is None:
-                skipped_symbols.append(symbol)
+                mark_skipped(symbol, "no_valid_windows", skipped_symbols, skip_reasons)
                 continue
 
             evaluated_symbols.append(symbol)
@@ -331,6 +342,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
                         start_idx=int(best["best_window_start"]),
                         end_idx=int(best["best_window_end"]),
                         length_days=int(best["best_window_len"]),
+                        candidate_windows_count=int(best["candidate_windows_count"]),
                     ),
                     notes=notes,
                 )
@@ -338,11 +350,9 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
 
         results.sort(key=lambda x: x.similarity, reverse=True)
 
-        # debug-режим: всегда возвращаем top-k лучших, даже если совпадения средние
-        if req.debug:
-            final_results = results[: req.top_k]
-        else:
-            final_results = results[: req.top_k]
+        # Никакого жесткого threshold здесь нет:
+        # top-k лучших всегда возвращаются.
+        final_results = results[: req.top_k]
 
         return ScanResponse(
             pattern_name=req.pattern_name,
@@ -352,6 +362,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             unresolved_symbols=unresolved_symbols,
             evaluated_symbols=evaluated_symbols,
             skipped_symbols=skipped_symbols,
+            skip_reasons=skip_reasons,
             results=final_results,
         )
     finally:

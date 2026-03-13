@@ -1,7 +1,13 @@
+import os
+
+os.environ.setdefault("COINGECKO_AUTH_MODE", "demo")
+os.environ.setdefault("COINGECKO_API_KEY", "test-demo-key")
+os.environ.setdefault("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3")
+
 import pytest
 import httpx
 
-from app.data_sources import CoinGeckoClient, MarketDataFetchResult
+from app.data_sources import CoinGeckoClient
 
 
 class DummyClient(CoinGeckoClient):
@@ -11,6 +17,7 @@ class DummyClient(CoinGeckoClient):
             base_url=self.auth.base_url,
             headers={
                 "accept": "application/json",
+                "user-agent": "crypto-pattern-scanner/1.0",
                 self.auth.header_name: self.auth.api_key,
             },
             timeout=10.0,
@@ -18,17 +25,14 @@ class DummyClient(CoinGeckoClient):
         )
 
 
-def _prices_payload(n=40):
+def prices_payload(n: int = 40) -> dict:
     return {"prices": [[1700000000000 + i * 86400000, float(i + 1)] for i in range(n)]}
 
 
 @pytest.mark.asyncio
-async def test_history_ok(monkeypatch):
-    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
-    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
-
-    async def handler(request: httpx.Request):
-        return httpx.Response(200, json=_prices_payload(50), request=request)
+async def test_history_ok():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=prices_payload(50), request=request)
 
     client = DummyClient(httpx.MockTransport(handler))
     result = await client.fetch_market_history("bitcoin", "usd", 450, "daily")
@@ -36,6 +40,7 @@ async def test_history_ok(monkeypatch):
 
     assert result.ok is True
     assert result.http_status == 200
+    assert result.auth_header_name == "x-cg-demo-api-key"
 
 
 @pytest.mark.asyncio
@@ -48,11 +53,8 @@ async def test_history_ok(monkeypatch):
         (429, "rate_limited"),
     ],
 )
-async def test_history_http_mapping(monkeypatch, status, reason):
-    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
-    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
-
-    async def handler(request: httpx.Request):
+async def test_history_http_mapping(status, reason):
+    def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(status, json={"error": "x"}, request=request)
 
     client = DummyClient(httpx.MockTransport(handler))
@@ -64,11 +66,8 @@ async def test_history_http_mapping(monkeypatch, status, reason):
 
 
 @pytest.mark.asyncio
-async def test_history_bad_schema(monkeypatch):
-    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
-    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
-
-    async def handler(request: httpx.Request):
+async def test_history_bad_schema():
+    def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"foo": "bar"}, request=request)
 
     client = DummyClient(httpx.MockTransport(handler))
@@ -80,11 +79,8 @@ async def test_history_bad_schema(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_history_empty(monkeypatch):
-    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
-    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
-
-    async def handler(request: httpx.Request):
+async def test_history_empty():
+    def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"prices": []}, request=request)
 
     client = DummyClient(httpx.MockTransport(handler))
@@ -96,11 +92,8 @@ async def test_history_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_history_timeout(monkeypatch):
-    monkeypatch.setenv("COINGECKO_AUTH_MODE", "demo")
-    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
-
-    async def handler(request: httpx.Request):
+async def test_history_timeout():
+    def handler(request: httpx.Request):
         raise httpx.ReadTimeout("timeout", request=request)
 
     client = DummyClient(httpx.MockTransport(handler))

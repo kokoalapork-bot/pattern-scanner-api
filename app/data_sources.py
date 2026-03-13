@@ -68,7 +68,6 @@ STABLE_NAME_KEYWORDS = [
     "euro coin",
 ]
 
-
 DEMO_HISTORY_MAX_DAYS = 365
 
 
@@ -81,6 +80,21 @@ class MarketDataFetchResult:
     ok: bool
     reason: str | None = None
     chart: dict[str, Any] | None = None
+    error_message: str | None = None
+    endpoint: str | None = None
+    http_status: int | None = None
+    request_params: Dict[str, Any] | None = None
+    auth_mode: str | None = None
+    base_url: str | None = None
+    api_key_present: bool | None = None
+    auth_header_name: str | None = None
+
+
+@dataclass
+class CoinSnapshotFetchResult:
+    ok: bool
+    reason: str | None = None
+    coin: dict[str, Any] | None = None
     error_message: str | None = None
     endpoint: str | None = None
     http_status: int | None = None
@@ -278,6 +292,165 @@ class CoinGeckoClient:
             items.extend(payload)
 
         return items
+
+    async def fetch_coin_snapshot_safe(self, coingecko_id: str, vs_currency: str = "usd") -> CoinSnapshotFetchResult:
+        endpoint = f"/coins/{coingecko_id}"
+        request_params = {
+            "localization": "false",
+            "tickers": "false",
+            "market_data": "true",
+            "community_data": "false",
+            "developer_data": "false",
+            "sparkline": "false",
+        }
+
+        try:
+            resp = await self.client.get(endpoint, params=request_params)
+            resp.raise_for_status()
+            payload = resp.json()
+
+            if not isinstance(payload, dict):
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="coin_snapshot_bad_response_schema",
+                    error_message=f"snapshot is not a dict: {type(payload).__name__}",
+                    endpoint="/coins/{id}",
+                    http_status=200,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            symbol = str(payload.get("symbol") or "").strip()
+            coin_id = str(payload.get("id") or "").strip()
+            name = str(payload.get("name") or "").strip()
+
+            if not coin_id:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="coin_snapshot_bad_response_schema",
+                    error_message="missing id in /coins/{id} response",
+                    endpoint="/coins/{id}",
+                    http_status=200,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            market_data = payload.get("market_data") or {}
+            market_cap = None
+            total_volume = None
+            if isinstance(market_data, dict):
+                market_cap = ((market_data.get("market_cap") or {}).get(vs_currency))
+                total_volume = ((market_data.get("total_volume") or {}).get(vs_currency))
+
+            coin = {
+                "id": coin_id,
+                "symbol": symbol,
+                "name": name or coin_id,
+                "market_cap": market_cap,
+                "total_volume": total_volume,
+            }
+
+            return CoinSnapshotFetchResult(
+                ok=True,
+                coin=coin,
+                endpoint="/coins/{id}",
+                http_status=200,
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            body_text = ""
+            try:
+                body_text = e.response.text[:500]
+            except Exception:
+                body_text = ""
+            error_message = str(e) if not body_text else f"{str(e)} | body={body_text}"
+
+            if status == 404:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="invalid_coingecko_id",
+                    error_message=error_message,
+                    endpoint="/coins/{id}",
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            if status == 401:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="coin_snapshot_http_401",
+                    error_message=error_message,
+                    endpoint="/coins/{id}",
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            if status == 403:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="coin_snapshot_http_403",
+                    error_message=error_message,
+                    endpoint="/coins/{id}",
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            if status == 429:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="rate_limited",
+                    error_message=error_message,
+                    endpoint="/coins/{id}",
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            return CoinSnapshotFetchResult(
+                ok=False,
+                reason="coin_snapshot_http_error",
+                error_message=error_message,
+                endpoint="/coins/{id}",
+                http_status=status,
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+
+        except httpx.TimeoutException as e:
+            return CoinSnapshotFetchResult(
+                ok=False,
+                reason="timeout",
+                error_message=str(e),
+                endpoint="/coins/{id}",
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+
+        except httpx.RequestError as e:
+            return CoinSnapshotFetchResult(
+                ok=False,
+                reason="network_error",
+                error_message=str(e),
+                endpoint="/coins/{id}",
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+
+        except Exception as e:
+            return CoinSnapshotFetchResult(
+                ok=False,
+                reason="coin_snapshot_failed",
+                error_message=f"{type(e).__name__}: {e}",
+                endpoint="/coins/{id}",
+                request_params=request_params,
+                **self.auth_debug(),
+            )
 
     async def fetch_market_history(
         self,

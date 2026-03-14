@@ -1212,7 +1212,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
             result_obj = ScanResult(
                 coingecko_id=coin_id,
                 symbol=symbol or coin_id.upper(),
-                name=name or coin_id,
+               name=name or coin_id,
                 age_days=asset_age_days,
                 market_cap_usd=float(coin.get("market_cap") or 0) if coin.get("market_cap") is not None else None,
                 volume_24h_usd=float(coin.get("total_volume") or 0) if coin.get("total_volume") is not None else None,
@@ -1238,9 +1238,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                     candidate_windows_count=int(best["candidate_windows_count"]),
                 ),
                 notes=notes if req.include_notes else [],
+                notes=notes if include_notes else [],
             )
 
             if req.return_pre_filter_candidates and should_surface_pre_filter_candidate(best):
+            if return_pre_filter_candidates and should_surface_pre_filter_candidate(best):
                 pre_filter_candidates.append(result_obj)
 
             if final_label == "reject":
@@ -1266,60 +1268,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                         "start_idx": int(best["best_window_start"]),
                         "end_idx": int(best["best_window_end"]),
                         "length_days": int(best["best_window_len"]),
-                        "best_age_days": int(best["best_age_days"]),
-                    },
-                    structural_score=float(best["structural_score"]),
-                    exemplar_consistency_score=float(best["exemplar_consistency_score"]),
-                    distance_to_siren_breakdown=float(best["distance_to_siren_breakdown"]),
-                    distance_to_river_breakdown=float(best["distance_to_river_breakdown"]),
-                    reference_band_passed=bool(best["reference_band_passed"]),
-                    raw_similarity=float(best["raw_similarity"]),
-                    label="watchlist candidate" if should_surface_pre_filter_candidate(best) else "reject",
-                )
-                continue
-
-            evaluated_assets.append(asset_key)
-            if symbol:
-                evaluated_symbols.append(symbol)
-
-            debug_by_symbol[asset_key] = DebugSymbolInfo(
-                input_symbol=source_meta.get("input_symbol"),
-                input_coingecko_id=source_meta.get("input_coingecko_id"),
-                source_type=source_meta.get("source_type"),
-                resolved=True,
-                coingecko_id=coin_id,
-                status="evaluated",
-                stage="score_windows",
-                reason=None,
-                endpoint=fetch.endpoint,
-                http_status=200,
-                request_params=fetch.request_params,
-                error_message=None,
-                auth_mode=fetch.auth_mode,
-                base_url=fetch.base_url,
-                api_key_present=fetch.api_key_present,
-                auth_header_name=fetch.auth_header_name,
-                universe_filter_status="included_for_scoring",
-                universe_filter_reason="included_for_scoring",
-                candidate_windows_count=int(best["candidate_windows_count"]),
-                best_window={
-                    "start_idx": int(best["best_window_start"]),
-                    "end_idx": int(best["best_window_end"]),
-                    "length_days": int(best["best_window_len"]),
-                    "best_age_days": int(best["best_age_days"]),
-                },
-                structural_score=float(best["structural_score"]),
-                exemplar_consistency_score=float(best["exemplar_consistency_score"]),
-                distance_to_siren_breakdown=float(best["distance_to_siren_breakdown"]),
-                distance_to_river_breakdown=float(best["distance_to_river_breakdown"]),
-                reference_band_passed=bool(best["reference_band_passed"]),
-                pre_breakout_base_score=float(best["pre_breakout_base_score"]),
-                raw_similarity=float(best["raw_similarity"]),
-                label=final_label,
-            )
-
-            results.append(result_obj)
-
+@@ -1323,50 +1338,61 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
         results.sort(key=lambda x: x.similarity, reverse=True)
         pre_filter_candidates.sort(key=lambda x: x.similarity, reverse=True)
         final_results = results[: req.top_k]
@@ -1345,6 +1294,17 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
             evaluated_count=len(evaluated_assets),
         )
 
+        if compact_response:
+            return CompactScanResponse(
+                pattern_name=req.pattern_name,
+                evaluated_count=len(evaluated_assets),
+                returned_count=len(final_results),
+                market_offset=req.market_offset,
+                market_batch_size=market_batch_size or len(candidates),
+                market_batch_ids=market_batch_ids,
+                results=[to_compact_scan_result(result) for result in final_results],
+            )
+
         return ScanResponse(
             pattern_name=req.pattern_name,
             evaluated_count=len(evaluated_assets),
@@ -1367,6 +1327,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
             debug_by_symbol=debug_by_symbol,
             results=final_results,
             pre_filter_candidates=final_prefilter if req.return_pre_filter_candidates else [],
+            pre_filter_candidates=final_prefilter if return_pre_filter_candidates else [],
         )
     finally:
         await client.close()

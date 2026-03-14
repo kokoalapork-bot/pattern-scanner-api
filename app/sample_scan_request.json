@@ -1,0 +1,14 @@
+{
+  "pattern_name": "crown_shelf_right_spike",
+  "min_age_days": 14,
+  "max_age_days": 90,
+  "top_k": 30,
+  "max_coins_to_evaluate": 30,
+  "market_batch_size": 30,
+  "universe_target_count": 1000,
+  "market_offset": 0,
+  "stage_mode": "pre_breakout_only",
+  "include_notes": true,
+  "return_pre_filter_candidates": true,
+  "compact_response": false
+}

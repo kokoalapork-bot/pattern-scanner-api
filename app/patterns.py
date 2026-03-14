@@ -120,14 +120,26 @@ class CrownShelfRightSpikeScorer:
         template_shape_score, template_notes = self._score_template_shape(xs)
 
         similarity = (
-            0.18 * crown_score +
-            0.14 * drop_score +
-            0.24 * shelf_score +
-            0.20 * spike_score +
-            0.14 * reversion_score +
-            0.05 * asymmetry_score +
-            0.05 * template_shape_score
+            0.20 * crown_score +
+            0.16 * drop_score +
+            0.26 * shelf_score +
+            0.16 * spike_score +
+            0.10 * reversion_score +
+            0.04 * asymmetry_score +
+            0.08 * template_shape_score
         ) * 100.0
+
+        base_first_bonus = max(
+            0.0,
+            (
+                0.32 * crown_score
+                + 0.28 * drop_score
+                + 0.40 * shelf_score
+                - 0.42
+            )
+        ) * 18.0
+        if spike_score < 0.35 and shelf_score >= 0.58:
+            similarity += base_first_bonus
 
         backbone = (shelf_score + spike_score + reversion_score) / 3.0
 
@@ -179,16 +191,19 @@ class CrownShelfRightSpikeScorer:
         )
 
     def _score_crown(self, crown_zone: List[float]) -> Tuple[float, List[str]]:
-        peaks = _local_peaks(crown_zone, min_prominence=0.02)
+        peaks = _local_peaks(crown_zone, min_prominence=0.015)
         top = max(crown_zone) if crown_zone else 0.0
         avg = _mean(crown_zone)
         vol = _stdev(crown_zone)
+        left_base = _mean(crown_zone[: max(3, len(crown_zone) // 5)]) if crown_zone else 0.0
+        right_base = _mean(crown_zone[-max(3, len(crown_zone) // 5):]) if crown_zone else 0.0
 
-        peak_count_score = min(1.0, len(peaks) / 3.0)
-        crest_score = max(0.0, min(1.0, (top - avg) / 0.20))
-        texture_score = max(0.0, min(1.0, vol / 0.11))
+        peak_count_score = min(1.0, len(peaks) / 2.0)
+        crest_score = max(0.0, min(1.0, (top - avg) / 0.16))
+        texture_score = max(0.0, min(1.0, vol / 0.09))
+        return_to_base_score = max(0.0, 1.0 - min(1.0, abs(right_base - left_base) / 0.12))
 
-        score = 0.45 * peak_count_score + 0.35 * crest_score + 0.20 * texture_score
+        score = 0.34 * peak_count_score + 0.28 * crest_score + 0.14 * texture_score + 0.24 * return_to_base_score
 
         notes: List[str] = []
         if score >= 0.65:
@@ -219,8 +234,8 @@ class CrownShelfRightSpikeScorer:
         vol = _stdev(shelf_zone)
         slope = abs(_mean(shelf_zone[-8:]) - _mean(shelf_zone[:8])) if len(shelf_zone) >= 16 else 0.0
 
-        flatness = max(0.0, 1.0 - min(1.0, vol / 0.09))
-        levelness = max(0.0, 1.0 - min(1.0, slope / 0.12))
+        flatness = max(0.0, 1.0 - min(1.0, vol / 0.11))
+        levelness = max(0.0, 1.0 - min(1.0, slope / 0.15))
         score = 0.65 * flatness + 0.35 * levelness
 
         if score >= 0.70:
@@ -333,7 +348,7 @@ class CrownShelfRightSpikeScorer:
             notes.append("Стадия: паттерн еще активен и потенциально торгуем.")
             return "active", notes
 
-        if shelf_score >= 0.45 and spike_score < 0.30:
+        if shelf_score >= 0.45 and spike_score < 0.40:
             notes.append("Стадия: паттерн еще формируется.")
             return "forming", notes
 

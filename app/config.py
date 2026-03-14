@@ -38,8 +38,14 @@ class Settings(BaseSettings):
     coingecko_base_url: str = Field(default="")
 
     request_timeout_seconds: float = 20.0
-    history_retry_count: int = 3
-    history_backoff_base_seconds: float = 0.8
+    history_retry_count: int = 4
+    history_backoff_base_seconds: float = 1.2
+
+    market_page_pause_seconds: float = 1.2
+    history_request_pause_seconds: float = 0.35
+    coingecko_max_concurrency: int = 2
+    automatic_scan_max_pages: int = 8
+
 
     stable_price_peg_center: float = 1.0
     stable_price_peg_tolerance: float = 0.15

@@ -50,6 +50,7 @@ class ScanRequest(BaseModel):
     market_offset: int = Field(default=0, ge=0)
     market_batch_size: Optional[int] = Field(default=None, ge=1, le=500)
     return_pre_filter_candidates: bool = True
+    compact_response: bool = False
 
 
 class MatchBreakdown(BaseModel):
@@ -75,45 +76,7 @@ class DebugSymbolInfo(BaseModel):
     input_coingecko_id: str | None = None
     source_type: str | None = None
 
-    resolved: bool = False
-    coingecko_id: str | None = None
-    status: str = "unknown"
-    stage: str = "unknown"
-    reason: str | None = None
-
-    endpoint: str | None = None
-    http_status: int | None = None
-    request_params: Dict[str, Any] | None = None
-    error_message: str | None = None
-
-    auth_mode: str | None = None
-    base_url: str | None = None
-    api_key_present: bool | None = None
-    auth_header_name: str | None = None
-
-    universe_filter_status: str | None = None
-    universe_filter_reason: str | None = None
-
-    candidate_windows_count: int | None = None
-    best_window: Dict[str, Any] | None = None
-
-    structural_score: float | None = None
-    exemplar_consistency_score: float | None = None
-    distance_to_siren_breakdown: float | None = None
-    distance_to_river_breakdown: float | None = None
-    reference_band_passed: bool | None = None
-    pre_breakout_base_score: float | None = None
-
-    raw_similarity: float | None = None
-    label: str | None = None
-
-
-class ScanResult(BaseModel):
-    coingecko_id: str
-    symbol: str
-    name: str
-    age_days: int
-    market_cap_usd: float | None = None
+@@ -117,59 +118,77 @@ class ScanResult(BaseModel):
     volume_24h_usd: float | None = None
 
     similarity: float
@@ -137,6 +100,14 @@ class ScanResult(BaseModel):
 
     notes: list[str] = []
     source: str = "coingecko"
+
+
+class CompactScanResult(BaseModel):
+    coingecko_id: str
+    symbol: str
+    name: str
+    similarity: float
+    label: str
 
 
 class ScanResponse(BaseModel):
@@ -169,6 +140,16 @@ class ScanResponse(BaseModel):
 
     results: list[ScanResult]
     pre_filter_candidates: list[ScanResult] = []
+
+
+class CompactScanResponse(BaseModel):
+    pattern_name: PatternName
+    evaluated_count: int
+    returned_count: int
+    market_offset: int = 0
+    market_batch_size: int = 0
+    market_batch_ids: list[str] = []
+    results: list[CompactScanResult]
 
 
 class ErrorResponse(BaseModel):

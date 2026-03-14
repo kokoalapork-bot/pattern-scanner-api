@@ -89,11 +89,10 @@ def age_from_chart_days(chart: dict) -> int | None:
 
 
 def generate_window_lengths(min_age_days: int, max_age_days: int) -> list[int]:
-    candidates = [14, 18, 21, 24, 28, 30, 35, 42, 49, 56, 63, 70, 77, 84, 90, 100, 120, 150, 180, 240, 300, 360]
+    candidates = [30, 45, 60, 75, 90, 120, 150, 180, 210, 240, 300, 360]
     out = [w for w in candidates if min_age_days <= w <= max_age_days]
     if not out:
-        fallback = max(min_age_days, min(max_age_days, 30))
-        out = [fallback]
+        out = [max(30, min(max_age_days, 60))]
     return out
 
 
@@ -129,28 +128,26 @@ def position_bonus(start_idx: int, end_idx: int, total_len: int) -> float:
     start_ratio = start_idx / total_len
     right_tail = total_len - end_idx
 
-    if end_ratio < 0.20:
-        return 0.72
     if end_ratio < 0.35:
-        return 0.84
+        return 0.25
 
     if right_tail <= 1:
-        return 0.35
+        return 0.10
     if right_tail <= 3:
-        return 0.55
+        return 0.30
     if right_tail <= 6:
-        return 0.78
-    if right_tail <= 18:
+        return 0.55
+    if right_tail <= 14:
         return 1.00
 
-    target = 0.78
+    target = 0.82
     distance = abs(end_ratio - target)
-    pos_score = max(0.0, 1.0 - distance / 0.42)
+    pos_score = max(0.0, 1.0 - distance / 0.35)
 
-    if start_ratio > 0.86:
-        pos_score *= 0.72
-    elif start_ratio > 0.76:
-        pos_score *= 0.86
+    if start_ratio > 0.80:
+        pos_score *= 0.55
+    elif start_ratio > 0.70:
+        pos_score *= 0.78
 
     return max(0.0, min(1.0, pos_score))
 
@@ -754,8 +751,18 @@ def mark_skipped(
     distance_to_siren_breakdown: float | None = None,
     distance_to_river_breakdown: float | None = None,
     reference_band_passed: bool | None = None,
+    pre_breakout_base_score: float | None = None,
     raw_similarity: float | None = None,
     label: str | None = None,
+    early_impulse_score: float | None = None,
+    return_to_base_score: float | None = None,
+    base_duration_score: float | None = None,
+    base_compaction_score: float | None = None,
+    right_side_tightening_score: float | None = None,
+    breakout_not_started_score: float | None = None,
+    late_breakout_penalty: float | None = None,
+    post_breakout_extension_penalty: float | None = None,
+    selected_window_stage: str | None = None,
 ):
     if asset_key not in skipped_assets:
         skipped_assets.append(asset_key)
@@ -789,8 +796,18 @@ def mark_skipped(
         distance_to_siren_breakdown=distance_to_siren_breakdown,
         distance_to_river_breakdown=distance_to_river_breakdown,
         reference_band_passed=reference_band_passed,
+        pre_breakout_base_score=pre_breakout_base_score,
         raw_similarity=raw_similarity,
         label=label,
+        early_impulse_score=early_impulse_score,
+        return_to_base_score=return_to_base_score,
+        base_duration_score=base_duration_score,
+        base_compaction_score=base_compaction_score,
+        right_side_tightening_score=right_side_tightening_score,
+        breakout_not_started_score=breakout_not_started_score,
+        late_breakout_penalty=late_breakout_penalty,
+        post_breakout_extension_penalty=post_breakout_extension_penalty,
+        selected_window_stage=selected_window_stage,
     )
 
 
@@ -842,16 +859,6 @@ def classify_universe_filter_from_market(coin: dict) -> tuple[str, str]:
         return "excluded_stablecoin", "excluded_stablecoin_denylist"
 
     return "included_for_scoring", "included_for_scoring"
-
-def compute_auto_scan_pages(req: ScanRequest) -> int:
-    desired_universe = max(
-        req.universe_target_count,
-        req.market_offset + (req.market_batch_size or req.max_coins_to_evaluate or 30),
-        req.max_coins_to_evaluate,
-    )
-    per_page = max(1, settings.market_universe_per_page)
-    pages = (desired_universe + per_page - 1) // per_page
-    return max(1, min(pages, settings.automatic_scan_max_pages, settings.market_universe_pages))
 
 
 async def build_automatic_market_universe(
@@ -906,11 +913,13 @@ async def build_automatic_market_universe(
         }
 
     all_candidates = dedupe_candidates_by_id(all_candidates)
-    target_universe_count = max(req.universe_target_count, req.market_offset + (req.market_batch_size or req.max_coins_to_evaluate or 30))
-    all_candidates = all_candidates[:target_universe_count]
     universe_total_count = len(all_candidates)
 
-    batch_size = req.market_batch_size or req.max_coins_to_evaluate or 30
+    universe_target_count = max(1, int(getattr(req, "universe_target_count", 1000) or 1000))
+    if len(all_candidates) > universe_target_count:
+        all_candidates = all_candidates[:universe_target_count]
+
+    batch_size = req.market_batch_size or req.max_coins_to_evaluate or 50
     market_offset = max(0, int(req.market_offset))
     sliced_candidates = all_candidates[market_offset: market_offset + batch_size]
     market_batch_ids = [str(c.get("id", "")).lower() for c in sliced_candidates if str(c.get("id", "")).strip()]
@@ -958,8 +967,8 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                 ),
             )
         else:
-            # Automatic scans fetch only as many pages as needed for the requested universe slice.
-            pages = compute_auto_scan_pages(req)
+            # For automatic scans, fetch a broad universe but return only a compact batch.
+            pages = settings.market_universe_pages
 
         try:
             markets = await client.get_markets(
@@ -1127,7 +1136,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                 )
                 continue
 
-            requested_history_days = max(req.max_age_days, min(req.universe_target_count // 10, 365)) if req.max_age_days > 120 else req.max_age_days
+            requested_history_days = min(450, req.max_age_days)
             effective_history_days, days_capped = client.normalize_history_days(requested_history_days)
 
             debug_by_symbol[asset_key] = DebugSymbolInfo(

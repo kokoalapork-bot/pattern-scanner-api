@@ -1,4 +1,9 @@
 import asyncio
+import os
+
+os.environ.setdefault("COINGECKO_AUTH_MODE", "demo")
+os.environ.setdefault("COINGECKO_API_KEY", "test-demo-key")
+os.environ.setdefault("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3")
 from types import SimpleNamespace
 
 from app.data_sources import MarketDataFetchResult

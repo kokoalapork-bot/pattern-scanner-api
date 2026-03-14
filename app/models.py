@@ -41,7 +41,7 @@ class ScanRequest(BaseModel):
     min_age_days: int = Field(default=14, ge=1, le=5000)
     max_age_days: int = Field(default=450, ge=1, le=5000)
     top_k: int = Field(default=20, ge=1, le=100)
-    max_coins_to_evaluate: int = Field(default=30, ge=1, le=1000)
+    max_coins_to_evaluate: int = Field(default=80, ge=1, le=500)
     vs_currency: str = Field(default="usd")
     include_notes: bool = True
     debug: bool = False
@@ -51,11 +51,10 @@ class ScanRequest(BaseModel):
     exclude_symbols: Optional[list[str]] = Field(default=None)
 
     market_offset: int = Field(default=0, ge=0)
-    market_batch_size: Optional[int] = Field(default=30, ge=1, le=1000)
-    universe_target_count: int = Field(default=1000, ge=30, le=5000)
+    market_batch_size: Optional[int] = Field(default=None, ge=1, le=500)
     return_pre_filter_candidates: bool = True
     compact_response: bool = False
-    stage_mode: StageMode = "pre_breakout_only"
+    stage_mode: StageMode = "legacy"
 
 
 class MatchBreakdown(BaseModel):

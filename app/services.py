@@ -463,6 +463,94 @@ def compute_pre_breakout_window_features(window_closes: list[float]) -> dict[str
         "prebreakout_structural": round(prebreakout_structural, 2),
     }
 
+
+def compute_listing_ath_road_features(window_closes: list[float]) -> dict[str, float]:
+    if len(window_closes) < 18:
+        return {
+            "listing_to_ath_score": 0.0,
+            "crown_after_ath_score": 0.0,
+            "drawdown_to_base_score": 0.0,
+            "not_dead_after_dump_score": 0.0,
+            "base_survival_score": 0.0,
+            "dump_to_zero_penalty": 1.0,
+            "road_fit_score": 0.0,
+        }
+
+    n = len(window_closes)
+    listing_zone = window_closes[: max(4, int(n * 0.12))]
+    search_end = max(8, min(n - 4, int(n * 0.45)))
+    ath_idx = max(range(search_end), key=lambda i: window_closes[i])
+    ath = window_closes[ath_idx]
+    listing_floor = min(listing_zone)
+    listing_mid = _safe_mean(listing_zone)
+    total_low = min(window_closes)
+    denom = max(1e-9, ath - min(total_low, listing_floor))
+
+    # 1) Быстрый ранний импульс после листинга.
+    listing_to_ath_ratio = max(0.0, ath - listing_mid) / max(1e-9, listing_mid)
+    listing_to_ath_score = max(0.0, min(1.0, listing_to_ath_ratio / 1.15))
+
+    # 2) Корона / распределение у верхов после ATH.
+    crown_slice = window_closes[max(0, ath_idx - 2): min(n, ath_idx + max(5, int(n * 0.12)))]
+    near_ath = sum(1 for x in crown_slice if x >= ath * 0.84) / max(1, len(crown_slice))
+    crown_std = _safe_std(crown_slice) / max(1e-9, ath)
+    crown_after_ath_score = max(
+        0.0,
+        min(1.0, 0.60 * near_ath + 0.40 * min(1.0, crown_std / 0.10)),
+    )
+
+    # 3) Слив после ATH, но не в ноль.
+    post = window_closes[ath_idx + 1:]
+    if len(post) < 6:
+        return {
+            "listing_to_ath_score": round(listing_to_ath_score, 4),
+            "crown_after_ath_score": round(crown_after_ath_score, 4),
+            "drawdown_to_base_score": 0.0,
+            "not_dead_after_dump_score": 0.0,
+            "base_survival_score": 0.0,
+            "dump_to_zero_penalty": 1.0,
+            "road_fit_score": 0.0,
+        }
+
+    base_search = post[: max(6, int(len(post) * 0.70))]
+    post_min = min(base_search)
+    post_min_idx = ath_idx + 1 + base_search.index(post_min)
+    dump_ratio = max(0.0, ath - post_min) / max(1e-9, ath - listing_floor)
+
+    # Цель примерно как у River/Siren: глубокий, но живой откат.
+    drawdown_to_base_score = max(0.0, min(1.0, 1.0 - abs(dump_ratio - 0.82) / 0.22))
+
+    retained_from_ath = post_min / max(1e-9, ath)
+    not_dead_after_dump_score = max(0.0, min(1.0, (retained_from_ath - 0.10) / 0.18))
+    dump_to_zero_penalty = max(0.0, min(1.0, (0.12 - retained_from_ath) / 0.08))
+
+    # 4) Дальше должна быть живая дорожка/полка, а не мёртвая линия.
+    road = window_closes[post_min_idx: max(post_min_idx + 4, int(n * 0.90))]
+    road_band_high = post_min + 0.38 * (ath - post_min)
+    in_road_band = sum(1 for x in road if post_min <= x <= road_band_high) / max(1, len(road))
+    road_std = _safe_std(road) / max(1e-9, ath - post_min)
+    alive_vol = max(0.0, min(1.0, road_std / 0.22))
+    base_survival_score = max(0.0, min(1.0, 0.72 * in_road_band + 0.28 * alive_vol))
+
+    road_fit_score = 100.0 * (
+        0.16 * listing_to_ath_score
+        + 0.16 * crown_after_ath_score
+        + 0.26 * drawdown_to_base_score
+        + 0.18 * not_dead_after_dump_score
+        + 0.24 * base_survival_score
+    )
+    road_fit_score = max(0.0, min(100.0, road_fit_score - 28.0 * dump_to_zero_penalty))
+
+    return {
+        "listing_to_ath_score": round(listing_to_ath_score, 4),
+        "crown_after_ath_score": round(crown_after_ath_score, 4),
+        "drawdown_to_base_score": round(drawdown_to_base_score, 4),
+        "not_dead_after_dump_score": round(not_dead_after_dump_score, 4),
+        "base_survival_score": round(base_survival_score, 4),
+        "dump_to_zero_penalty": round(dump_to_zero_penalty, 4),
+        "road_fit_score": round(road_fit_score, 2),
+    }
+
 def find_best_window(closes: list[float], min_age_days: int, max_age_days: int, stage_mode: str = "legacy"):
     best_effective = -1.0
     best = None
@@ -495,30 +583,40 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int, 
         )
 
         pre_breakout_window = compute_pre_breakout_window_features(window_closes)
+        listing_path = compute_listing_ath_road_features(window_closes)
+
         structural_for_blend = effective_structural
         if stage_mode == "pre_breakout_only":
-            structural_for_blend = 0.55 * effective_structural + 0.45 * float(pre_breakout_window["prebreakout_structural"])
+            structural_for_blend = 0.43 * effective_structural + 0.32 * float(pre_breakout_window["prebreakout_structural"]) + 0.25 * float(listing_path["road_fit_score"])
+        else:
+            structural_for_blend = 0.78 * effective_structural + 0.22 * float(listing_path["road_fit_score"])
 
         final_score = combine_scores(
             structural_score=structural_for_blend,
             exemplar_consistency_score=float(exemplar_metrics["exemplar_consistency_score"]),
         )
         final_score = round(
-            final_score * (0.82 + 0.18 * (float(pre_breakout["pre_breakout_base_score"]) / 100.0)),
+            final_score
+            * (0.78 + 0.14 * (float(pre_breakout["pre_breakout_base_score"]) / 100.0) + 0.08 * (float(listing_path["base_survival_score"]))),
             2,
         )
-        if stage_mode == "pre_breakout_only":
-            final_score = round(
-                max(0.0, final_score - 12.0 * float(pre_breakout_window["late_breakout_penalty"]) - 10.0 * float(pre_breakout_window["post_breakout_extension_penalty"])),
-                2,
-            )
+        final_score = round(
+            max(
+                0.0,
+                final_score
+                - 12.0 * float(pre_breakout_window["late_breakout_penalty"])
+                - 10.0 * float(pre_breakout_window["post_breakout_extension_penalty"])
+                - 22.0 * float(listing_path["dump_to_zero_penalty"]),
+            ),
+            2,
+        )
 
         if final_score > best_effective:
             best_effective = final_score
             best = {
                 "similarity": round(final_score, 2),
                 "raw_similarity": round(structural_score, 2),
-                "structural_score": round(effective_structural, 2),
+                "structural_score": round(structural_for_blend, 2),
                 "base_label": result.label,
                 "stage": result.stage,
                 "breakdown": result.breakdown,
@@ -544,6 +642,13 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int, 
                 "late_breakout_penalty": float(pre_breakout_window["late_breakout_penalty"]),
                 "post_breakout_extension_penalty": float(pre_breakout_window["post_breakout_extension_penalty"]),
                 "selected_window_stage": str(pre_breakout_window["selected_window_stage"]),
+                "listing_to_ath_score": float(listing_path["listing_to_ath_score"]),
+                "crown_after_ath_score": float(listing_path["crown_after_ath_score"]),
+                "drawdown_to_base_score": float(listing_path["drawdown_to_base_score"]),
+                "not_dead_after_dump_score": float(listing_path["not_dead_after_dump_score"]),
+                "base_survival_score": float(listing_path["base_survival_score"]),
+                "dump_to_zero_penalty": float(listing_path["dump_to_zero_penalty"]),
+                "road_fit_score": float(listing_path["road_fit_score"]),
             }
 
     if best is None:
@@ -1209,15 +1314,11 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
             chart = fetch.chart or {}
             closes = coingecko_daily_closes(chart)
 
-            manual_input_requested = bool(req.coingecko_ids or req.symbols)
-            manual_candidate = source_meta.get("source_type") in {"coingecko_id", "symbol"}
-            bypass_low_volatility_filter = manual_input_requested and manual_candidate
-
+            manual_input = bool(req.coingecko_ids or req.symbols)
             behavioral_status, behavioral_reason = classify_behavioral_universe_filter(closes)
-            if bypass_low_volatility_filter and behavioral_reason == "excluded_low_volatility":
+            if manual_input and source_meta.get("source_type") in {"coingecko_id", "symbol"}:
                 behavioral_status = "included_for_scoring"
-                behavioral_reason = "manual_override_low_volatility"
-
+                behavioral_reason = "manual_override"
             if behavioral_status != "included_for_scoring":
                 mark_skipped(
                     asset_key=asset_key,
@@ -1239,8 +1340,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                     universe_filter_reason=behavioral_reason,
                 )
                 continue
-
-            min_required_closes = 14 if (req.stage_mode == "pre_breakout_only" or bypass_low_volatility_filter) else 30
 
             if len(closes) == 0:
                 mark_skipped(
@@ -1264,6 +1363,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                 )
                 continue
 
+            min_required_closes = 14 if (req.stage_mode == "pre_breakout_only" or manual_input) else 30
             if len(closes) < min_required_closes:
                 mark_skipped(
                     asset_key=asset_key,
@@ -1396,6 +1496,13 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
             best.setdefault("late_breakout_penalty", 0.0)
             best.setdefault("post_breakout_extension_penalty", 0.0)
             best.setdefault("selected_window_stage", str(best.get("stage") or "active"))
+            best.setdefault("listing_to_ath_score", 0.0)
+            best.setdefault("crown_after_ath_score", 0.0)
+            best.setdefault("drawdown_to_base_score", 0.0)
+            best.setdefault("not_dead_after_dump_score", 0.0)
+            best.setdefault("base_survival_score", 0.0)
+            best.setdefault("dump_to_zero_penalty", 1.0)
+            best.setdefault("road_fit_score", 0.0)
 
             final_label = classify_final_label(
                 base_label=str(best["base_label"]),
@@ -1427,6 +1534,9 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
             )
             notes.append(
                 f"Breakout guard: not_started={best['breakout_not_started_score']}, late_penalty={best['late_breakout_penalty']}, post_ext_penalty={best['post_breakout_extension_penalty']}, window_stage={best['selected_window_stage']}"
+            )
+            notes.append(
+                f"Listing/ATH path: list_to_ath={best['listing_to_ath_score']}, crown_after_ath={best['crown_after_ath_score']}, drawdown_to_base={best['drawdown_to_base_score']}, not_dead={best['not_dead_after_dump_score']}, base_survival={best['base_survival_score']}, dump_to_zero_penalty={best['dump_to_zero_penalty']}, road_fit={best['road_fit_score']}"
             )
             if not best["reference_band_passed"]:
                 notes.append("Reference band guardrail failed: candidate can still surface as watchlist/pre-filter.")

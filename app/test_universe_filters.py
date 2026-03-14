@@ -121,4 +121,66 @@ def test_debug_invariants(monkeypatch):
         )
         assert has_matching_key
 
-    assert "XCN" in set(resp.resolved_symbols) | set(resp.unresolved_symbols) | set(resp.evaluated_symbols) | set(resp.skipped_symbols)
+    assert "XCN" in set(resp.resolved_symbols) | set(resp.unresolved_symbols) | set(resp.evaluated_symbols) | set(resp.skipped_symbols) (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/app/test_universe_filters.py b/app/test_universe_filters.py
+index 3ffb4dafa717216a134c9c5e6c210d08cf83ee23..3372420d1a7602f5b26223e919be0da2ebe637d3 100644
+--- a/app/test_universe_filters.py
++++ b/app/test_universe_filters.py
+@@ -1,46 +1,54 @@
++from types import SimpleNamespace
+ import pytest
+ 
+ from app.data_sources import MarketDataFetchResult
+ from app.services import scan_pattern
+ from app.models import ScanRequest
+ 
+ 
+ class DummyClient:
+     def __init__(self, markets, fetch_map):
+         self._markets = markets
+         self._fetch_map = fetch_map
++        self.auth = SimpleNamespace(mode="demo", base_url="https://api.coingecko.com/api/v3", api_key_present=True, header_name="x-cg-demo-api-key")
+ 
+     async def close(self):
+         return None
+ 
+     async def get_markets(self, vs_currency="usd", pages=1, per_page=250):
+         return self._markets
+ 
+     async def fetch_market_chart_safe(self, coin_id: str, vs_currency="usd", days=450):
+         return self._fetch_map[coin_id]
+ 
++    async def fetch_market_history(self, coingecko_id: str, vs_currency="usd", days=450, interval="daily"):
++        return self._fetch_map[coingecko_id]
++
++    def normalize_history_days(self, requested_days: int):
++        return requested_days, False
++
+ 
+ @pytest.mark.asyncio
+ async def test_rate_limited_reason(monkeypatch):
+     from app import services
+ 
+     markets = [
+         {"id": "siren", "symbol": "siren", "name": "SIREN", "market_cap": 10_000_000, "total_volume": 1_000_000},
+         {"id": "river", "symbol": "river", "name": "RIVER", "market_cap": 10_000_000, "total_volume": 1_000_000},
+     ]
+     fetch_map = {
+         "siren": MarketDataFetchResult(ok=False, reason="rate_limited"),
+         "river": MarketDataFetchResult(ok=False, reason="rate_limited"),
+     }
+ 
+     monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
+ 
+     req = ScanRequest(
+         symbols=["SIREN", "RIVER"],
+         min_age_days=14,
+         max_age_days=450,
+         top_k=10,
+     )
+     resp = await scan_pattern(req)
+ 
+     assert resp.resolved_symbols == ["SIREN", "RIVER"]
+ 
+EOF
+)

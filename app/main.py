@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from .config import settings
 from .data_sources import build_coingecko_auth
 from .models import ErrorResponse, ScanRequest, ScanResponse
+from .models import CompactScanResponse, ErrorResponse, ScanRequest, ScanResponse
 from .services import scan_pattern
 
 BASE_URL = "https://pattern-scanner-api.onrender.com"
@@ -53,6 +54,7 @@ async def health() -> HealthResponse:
 @app.post(
     "/scan",
     response_model=ScanResponse,
+    response_model=ScanResponse | CompactScanResponse,
     responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
     summary="Scan assets by symbols and/or coingecko_ids",
 )
@@ -78,7 +80,3 @@ async def root() -> RootResponse:
         message="Crypto Pattern Scanner API",
         docs="/docs",
         health="/health",
-        openapi="/openapi.json",
-        default_min_age_days=settings.default_min_age_days,
-        default_max_age_days=settings.default_max_age_days,
-    )

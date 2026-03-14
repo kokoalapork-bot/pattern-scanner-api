@@ -1209,7 +1209,15 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
             chart = fetch.chart or {}
             closes = coingecko_daily_closes(chart)
 
+            manual_input_requested = bool(req.coingecko_ids or req.symbols)
+            manual_candidate = source_meta.get("source_type") in {"coingecko_id", "symbol"}
+            bypass_low_volatility_filter = manual_input_requested and manual_candidate
+
             behavioral_status, behavioral_reason = classify_behavioral_universe_filter(closes)
+            if bypass_low_volatility_filter and behavioral_reason == "excluded_low_volatility":
+                behavioral_status = "included_for_scoring"
+                behavioral_reason = "manual_override_low_volatility"
+
             if behavioral_status != "included_for_scoring":
                 mark_skipped(
                     asset_key=asset_key,
@@ -1231,6 +1239,8 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                     universe_filter_reason=behavioral_reason,
                 )
                 continue
+
+            min_required_closes = 14 if (req.stage_mode == "pre_breakout_only" or bypass_low_volatility_filter) else 30
 
             if len(closes) == 0:
                 mark_skipped(
@@ -1254,7 +1264,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                 )
                 continue
 
-            if len(closes) < 30:
+            if len(closes) < min_required_closes:
                 mark_skipped(
                     asset_key=asset_key,
                     coingecko_id=coin_id,
@@ -1266,7 +1276,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                     endpoint=fetch.endpoint,
                     http_status=fetch.http_status,
                     request_params=fetch.request_params,
-                    error_message=f"need >= 30 closes, got {len(closes)}",
+                    error_message=f"need >= {min_required_closes} closes, got {len(closes)}",
                     auth_mode=fetch.auth_mode,
                     base_url=fetch.base_url,
                     api_key_present=fetch.api_key_present,

@@ -751,8 +751,18 @@ def mark_skipped(
     distance_to_siren_breakdown: float | None = None,
     distance_to_river_breakdown: float | None = None,
     reference_band_passed: bool | None = None,
+    pre_breakout_base_score: float | None = None,
     raw_similarity: float | None = None,
     label: str | None = None,
+    early_impulse_score: float | None = None,
+    return_to_base_score: float | None = None,
+    base_duration_score: float | None = None,
+    base_compaction_score: float | None = None,
+    right_side_tightening_score: float | None = None,
+    breakout_not_started_score: float | None = None,
+    late_breakout_penalty: float | None = None,
+    post_breakout_extension_penalty: float | None = None,
+    selected_window_stage: str | None = None,
 ):
     if asset_key not in skipped_assets:
         skipped_assets.append(asset_key)
@@ -786,8 +796,18 @@ def mark_skipped(
         distance_to_siren_breakdown=distance_to_siren_breakdown,
         distance_to_river_breakdown=distance_to_river_breakdown,
         reference_band_passed=reference_band_passed,
+        pre_breakout_base_score=pre_breakout_base_score,
         raw_similarity=raw_similarity,
         label=label,
+        early_impulse_score=early_impulse_score,
+        return_to_base_score=return_to_base_score,
+        base_duration_score=base_duration_score,
+        base_compaction_score=base_compaction_score,
+        right_side_tightening_score=right_side_tightening_score,
+        breakout_not_started_score=breakout_not_started_score,
+        late_breakout_penalty=late_breakout_penalty,
+        post_breakout_extension_penalty=post_breakout_extension_penalty,
+        selected_window_stage=selected_window_stage,
     )
 
 
@@ -894,6 +914,10 @@ async def build_automatic_market_universe(
 
     all_candidates = dedupe_candidates_by_id(all_candidates)
     universe_total_count = len(all_candidates)
+
+    universe_target_count = max(1, int(getattr(req, "universe_target_count", 1000) or 1000))
+    if len(all_candidates) > universe_target_count:
+        all_candidates = all_candidates[:universe_target_count]
 
     batch_size = req.market_batch_size or req.max_coins_to_evaluate or 50
     market_offset = max(0, int(req.market_offset))
@@ -1593,7 +1617,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
             debug_by_symbol=debug_by_symbol,
             results=final_results,
             pre_filter_candidates=final_prefilter if return_pre_filter_candidates else [],
-):
-    ...
+        )
     finally:
         await client.close()

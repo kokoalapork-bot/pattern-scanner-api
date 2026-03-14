@@ -51,7 +51,7 @@ def test_scan_compact_response_mode(monkeypatch):
     monkeypatch.setattr(
         services,
         "find_best_window",
-        lambda closes, min_age_days, max_age_days: {
+        lambda closes, min_age_days, max_age_days, stage_mode="legacy": {
             "similarity": 91.0,
             "raw_similarity": 88.0,
             "structural_score": 82.0,

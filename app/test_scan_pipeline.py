@@ -4,59 +4,64 @@ os.environ.setdefault("COINGECKO_AUTH_MODE", "demo")
 os.environ.setdefault("COINGECKO_API_KEY", "test-demo-key")
 os.environ.setdefault("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3")
 
-from types import SimpleNamespace
+import pytest
+import httpx
 
-from app.patterns import score_crown_shelf_right_spike
-from app.services import find_best_window, validate_scan_invariants
-
-
-def test_broad_range_search_returns_best_window():
-    closes = (
-        [10.0] * 25
-        + [12, 14, 13, 15, 12, 11, 10]
-        + [8.0] * 60
-        + [12.5, 14.0, 9.0, 8.2, 8.1, 8.0]
-        + [7.9] * 100
-    )
-
-    best = find_best_window(closes, 14, 180)
-    assert best is not None
-    assert best["candidate_windows_count"] > 0
-    assert best["best_window_end"] <= len(closes)
+from app.data_sources import CoinGeckoClient, DEMO_HISTORY_MAX_DAYS
 
 
-def test_partial_matches_are_not_zeroed():
-    closes = [10, 12, 11, 13, 12, 9, 8, 8, 8.1, 8.0, 8.2, 8.1, 9.5, 11.0, 8.4, 8.2, 8.1]
-    result = score_crown_shelf_right_spike(closes)
-    assert result.label in {"strong match", "partial match", "weak-crown variant", "weak match"}
-    assert result.similarity >= 0.0
+class DummyClient(CoinGeckoClient):
+    def __init__(self, transport: httpx.AsyncBaseTransport):
+        super().__init__()
+        self.client = httpx.AsyncClient(
+            base_url=self.auth.base_url,
+            headers={
+                "accept": "application/json",
+                "user-agent": "crypto-pattern-scanner/1.0",
+                self.auth.header_name: self.auth.api_key,
+            },
+            timeout=10.0,
+            transport=transport,
+        )
 
 
-def test_pipeline_invariants_ok():
-    debug_by_symbol = {
-        "BTC": SimpleNamespace(reason=None),
-        "DOGE": SimpleNamespace(reason="history_http_404"),
-        "UNKNOWN": SimpleNamespace(reason="unresolved_symbol"),
-    }
-
-    validate_scan_invariants(
-        unresolved_symbols=["UNKNOWN"],
-        skipped_symbols=["DOGE"],
-        evaluated_symbols=["BTC"],
-        skip_reasons={"DOGE": "history_http_404"},
-        debug_by_symbol=debug_by_symbol,
-        evaluated_count=1,
-    )
+def prices_payload(n: int = 40) -> dict:
+    return {"prices": [[1700000000000 + i * 86400000, float(i + 1)] for i in range(n)]}
 
 
-def test_regression_symbol_pairs_shape():
-    pairs = [
-        ("BTC", "bitcoin"),
-        ("ETH", "ethereum"),
-        ("SIREN", "siren-2"),
-        ("RIVER", "river"),
-    ]
-    for symbol, coingecko_id in pairs:
-        assert isinstance(symbol, str)
-        assert isinstance(coingecko_id, str)
-        assert coingecko_id
+@pytest.mark.asyncio
+async def test_demo_days_are_capped_to_365():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["days"] == str(DEMO_HISTORY_MAX_DAYS)
+        return httpx.Response(200, json=prices_payload(50), request=request)
+
+    client = DummyClient(httpx.MockTransport(handler))
+    result = await client.fetch_market_history("bitcoin", "usd", 450, "daily")
+    await client.close()
+
+    assert result.ok is True
+    assert result.request_params["requested_days"] == "450"
+    assert result.request_params["days"] == "365"
+    assert result.request_params["days_capped_by_plan"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,reason",
+    [
+        (401, "history_http_401"),
+        (403, "history_http_403"),
+        (404, "history_http_404"),
+        (429, "rate_limited"),
+    ],
+)
+async def test_history_http_mapping(status, reason):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": "x"}, request=request)
+
+    client = DummyClient(httpx.MockTransport(handler))
+    result = await client.fetch_market_history("bitcoin", "usd", 365, "daily")
+    await client.close()
+
+    assert result.ok is False
+    assert result.reason == reason

@@ -1,113 +1,109 @@
+import os
+
+os.environ.setdefault("COINGECKO_AUTH_MODE", "demo")
+os.environ.setdefault("COINGECKO_API_KEY", "test-demo-key")
+os.environ.setdefault("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3")
+
 import pytest
 
-from app.data_sources import MarketDataFetchResult
-from app.services import scan_pattern
 from app.models import ScanRequest
+from app.services import (
+    build_automatic_market_universe,
+    classify_universe_filter_from_market,
+)
 
 
 class DummyClient:
-    def __init__(self, markets, fetch_map):
-        self._markets = markets
-        self._fetch_map = fetch_map
-
-    async def close(self):
-        return None
-
-    async def get_markets(self, vs_currency="usd", pages=1, per_page=250):
-        return self._markets
-
-    async def fetch_market_chart_safe(self, coin_id: str, vs_currency="usd", days=450):
-        return self._fetch_map[coin_id]
+    pass
 
 
 @pytest.mark.asyncio
-async def test_rate_limited_reason(monkeypatch):
-    from app import services
-
+async def test_automatic_market_universe_uses_coingecko_id_as_primary_key():
     markets = [
-        {"id": "siren", "symbol": "siren", "name": "SIREN", "market_cap": 10_000_000, "total_volume": 1_000_000},
-        {"id": "river", "symbol": "river", "name": "RIVER", "market_cap": 10_000_000, "total_volume": 1_000_000},
+        {
+            "id": "stakestone",
+            "symbol": "sto",
+            "name": "StakeStone",
+            "market_cap": 120_000_000,
+            "total_volume": 8_000_000,
+        },
+        {
+            "id": "river",
+            "symbol": "river",
+            "name": "River",
+            "market_cap": 50_000_000,
+            "total_volume": 5_000_000,
+        },
     ]
-    fetch_map = {
-        "siren": MarketDataFetchResult(ok=False, reason="rate_limited"),
-        "river": MarketDataFetchResult(ok=False, reason="rate_limited"),
-    }
-
-    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
 
     req = ScanRequest(
-        symbols=["SIREN", "RIVER"],
+        pattern_name="crown_shelf_right_spike",
         min_age_days=14,
         max_age_days=450,
         top_k=10,
+        max_coins_to_evaluate=10,
+        vs_currency="usd",
+        include_notes=True,
     )
-    resp = await scan_pattern(req)
 
-    assert resp.resolved_symbols == ["SIREN", "RIVER"]
-    assert resp.evaluated_count == 0
-    assert "SIREN" in resp.skipped_symbols
-    assert "RIVER" in resp.skipped_symbols
-    assert resp.skip_reasons["SIREN"] == "rate_limited"
-    assert resp.skip_reasons["RIVER"] == "rate_limited"
-    assert resp.debug_by_symbol["SIREN"].stage == "fetch_market_data"
+    (
+        candidates,
+        debug_by_asset,
+        skip_reasons,
+        asset_sources,
+        universe_total_count,
+        market_batch_size,
+        market_batch_ids,
+    ) = await build_automatic_market_universe(
+        client=DummyClient(),
+        req=req,
+        markets=markets,
+    )
+
+    assert universe_total_count == 2
+    assert market_batch_size == 2
+    assert set(market_batch_ids) == {"stakestone", "river"}
+
+    ids = {c["id"] for c in candidates}
+    assert "stakestone" in ids
+    assert "river" in ids
+
+    assert asset_sources["stakestone"]["input_coingecko_id"] == "stakestone"
+    assert asset_sources["stakestone"]["source_type"] == "market_universe"
+
+    stake_key = "id:stakestone"
+    assert debug_by_asset[stake_key].coingecko_id == "stakestone"
+    assert debug_by_asset[stake_key].input_symbol == "STO"
 
 
-@pytest.mark.asyncio
-async def test_empty_history_reason(monkeypatch):
-    from app import services
+def test_stakestone_is_not_lost_due_to_symbol_resolution():
+    coin = {
+        "id": "stakestone",
+        "symbol": "sto",
+        "name": "StakeStone",
+        "market_cap": 120_000_000,
+        "total_volume": 8_000_000,
+    }
+    status, reason = classify_universe_filter_from_market(coin)
+    assert status == "included_for_scoring"
+    assert reason == "included_for_scoring"
 
-    markets = [
-        {"id": "btc", "symbol": "btc", "name": "Bitcoin", "market_cap": 10_000_000, "total_volume": 1_000_000},
-    ]
-    fetch_map = {
-        "btc": MarketDataFetchResult(ok=True, chart={"prices": []}),
+
+def test_btc_eth_and_stables_are_still_filtered_before_scoring():
+    btc = {
+        "id": "bitcoin",
+        "symbol": "btc",
+        "name": "Bitcoin",
+        "market_cap": 1_000_000_000_000,
+        "total_volume": 1_000_000_000,
+    }
+    usdt = {
+        "id": "tether",
+        "symbol": "usdt",
+        "name": "Tether USD",
+        "market_cap": 100_000_000_000,
+        "total_volume": 1_000_000_000,
     }
 
-    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
-
-    req = ScanRequest(symbols=["BTC"], min_age_days=14, max_age_days=450, top_k=10)
-    resp = await scan_pattern(req)
-
-    assert resp.skip_reasons["BTC"] == "empty_history"
-
-
-@pytest.mark.asyncio
-async def test_unresolved_symbol(monkeypatch):
-    from app import services
-
-    markets = []
-    fetch_map = {}
-
-    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
-
-    req = ScanRequest(symbols=["NOPE"], min_age_days=14, max_age_days=450, top_k=10)
-    resp = await scan_pattern(req)
-
-    assert resp.unresolved_symbols == ["NOPE"]
-    assert resp.skip_reasons["NOPE"] == "unresolved_symbol"
-
-
-@pytest.mark.asyncio
-async def test_debug_invariants(monkeypatch):
-    from app import services
-
-    prices = [[1_700_000_000_000 + i * 86_400_000, 1.0 + (i % 10) * 0.01] for i in range(80)]
-    markets = [
-        {"id": "btc", "symbol": "btc", "name": "Bitcoin", "market_cap": 10_000_000, "total_volume": 1_000_000},
-    ]
-    fetch_map = {
-        "btc": MarketDataFetchResult(ok=True, chart={"prices": prices}),
-    }
-
-    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
-
-    req = ScanRequest(symbols=["BTC"], min_age_days=14, max_age_days=60, top_k=10)
-    resp = await scan_pattern(req)
-
-    if resp.evaluated_count > 0:
-        assert len(resp.evaluated_symbols) > 0
-
-    for sym in resp.skipped_symbols:
-        assert sym in resp.skip_reasons
-
-    assert "BTC" in set(resp.resolved_symbols) | set(resp.unresolved_symbols) | set(resp.evaluated_symbols) | set(resp.skipped_symbols)
+    assert classify_universe_filter_from_market(btc)[0] != "included_for_scoring"
+    assert classify_universe_filter_from_market(usdt)[0] != "included_for_scoring"

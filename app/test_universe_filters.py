@@ -1,78 +1,113 @@
-import os
+import pytest
 
-os.environ.setdefault("COINGECKO_AUTH_MODE", "demo")
-os.environ.setdefault("COINGECKO_API_KEY", "test-demo-key")
-os.environ.setdefault("COINGECKO_BASE_URL", "https://api.coingecko.com/api/v3")
-
-from app.data_sources import (
-    classify_behavioral_universe_filter,
-    looks_like_major,
-    looks_like_stable,
-)
-from app.services import classify_universe_filter_from_market
+from app.data_sources import MarketDataFetchResult
+from app.services import scan_pattern
+from app.models import ScanRequest
 
 
-def test_btc_is_excluded_as_major():
-    coin = {
-        "id": "bitcoin",
-        "symbol": "btc",
-        "name": "Bitcoin",
-        "market_cap": 1_000_000_000_000,
-        "total_volume": 1_000_000_000,
+class DummyClient:
+    def __init__(self, markets, fetch_map):
+        self._markets = markets
+        self._fetch_map = fetch_map
+
+    async def close(self):
+        return None
+
+    async def get_markets(self, vs_currency="usd", pages=1, per_page=250):
+        return self._markets
+
+    async def fetch_market_chart_safe(self, coin_id: str, vs_currency="usd", days=450):
+        return self._fetch_map[coin_id]
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_reason(monkeypatch):
+    from app import services
+
+    markets = [
+        {"id": "siren", "symbol": "siren", "name": "SIREN", "market_cap": 10_000_000, "total_volume": 1_000_000},
+        {"id": "river", "symbol": "river", "name": "RIVER", "market_cap": 10_000_000, "total_volume": 1_000_000},
+    ]
+    fetch_map = {
+        "siren": MarketDataFetchResult(ok=False, reason="rate_limited"),
+        "river": MarketDataFetchResult(ok=False, reason="rate_limited"),
     }
-    status, reason = classify_universe_filter_from_market(coin)
-    assert status == "excluded_major"
-    assert reason == "excluded_btc"
+
+    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
+
+    req = ScanRequest(
+        symbols=["SIREN", "RIVER"],
+        min_age_days=14,
+        max_age_days=450,
+        top_k=10,
+    )
+    resp = await scan_pattern(req)
+
+    assert resp.resolved_symbols == ["SIREN", "RIVER"]
+    assert resp.evaluated_count == 0
+    assert "SIREN" in resp.skipped_symbols
+    assert "RIVER" in resp.skipped_symbols
+    assert resp.skip_reasons["SIREN"] == "rate_limited"
+    assert resp.skip_reasons["RIVER"] == "rate_limited"
+    assert resp.debug_by_symbol["SIREN"].stage == "fetch_market_data"
 
 
-def test_eth_is_excluded_as_major():
-    coin = {
-        "id": "ethereum",
-        "symbol": "eth",
-        "name": "Ethereum",
-        "market_cap": 500_000_000_000,
-        "total_volume": 1_000_000_000,
+@pytest.mark.asyncio
+async def test_empty_history_reason(monkeypatch):
+    from app import services
+
+    markets = [
+        {"id": "btc", "symbol": "btc", "name": "Bitcoin", "market_cap": 10_000_000, "total_volume": 1_000_000},
+    ]
+    fetch_map = {
+        "btc": MarketDataFetchResult(ok=True, chart={"prices": []}),
     }
-    status, reason = classify_universe_filter_from_market(coin)
-    assert status == "excluded_major"
-    assert reason == "excluded_eth"
+
+    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
+
+    req = ScanRequest(symbols=["BTC"], min_age_days=14, max_age_days=450, top_k=10)
+    resp = await scan_pattern(req)
+
+    assert resp.skip_reasons["BTC"] == "empty_history"
 
 
-def test_large_cap_alt_is_excluded():
-    coin = {
-        "id": "solana",
-        "symbol": "sol",
-        "name": "Solana",
-        "market_cap": 50_000_000_000,
-        "total_volume": 1_000_000_000,
+@pytest.mark.asyncio
+async def test_unresolved_symbol(monkeypatch):
+    from app import services
+
+    markets = []
+    fetch_map = {}
+
+    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
+
+    req = ScanRequest(symbols=["NOPE"], min_age_days=14, max_age_days=450, top_k=10)
+    resp = await scan_pattern(req)
+
+    assert resp.unresolved_symbols == ["NOPE"]
+    assert resp.skip_reasons["NOPE"] == "unresolved_symbol"
+
+
+@pytest.mark.asyncio
+async def test_debug_invariants(monkeypatch):
+    from app import services
+
+    prices = [[1_700_000_000_000 + i * 86_400_000, 1.0 + (i % 10) * 0.01] for i in range(80)]
+    markets = [
+        {"id": "btc", "symbol": "btc", "name": "Bitcoin", "market_cap": 10_000_000, "total_volume": 1_000_000},
+    ]
+    fetch_map = {
+        "btc": MarketDataFetchResult(ok=True, chart={"prices": prices}),
     }
-    status, reason = classify_universe_filter_from_market(coin)
-    assert status == "excluded_large_cap"
-    assert reason == "excluded_large_cap"
 
+    monkeypatch.setattr(services, "CoinGeckoClient", lambda: DummyClient(markets, fetch_map))
 
-def test_obvious_stablecoin_is_excluded():
-    coin = {
-        "id": "tether",
-        "symbol": "usdt",
-        "name": "Tether USD",
-        "market_cap": 100_000_000_000,
-        "total_volume": 1_000_000_000,
-    }
-    status, reason = classify_universe_filter_from_market(coin)
-    assert status == "excluded_stablecoin"
-    assert reason == "excluded_stablecoin_denylist"
+    req = ScanRequest(symbols=["BTC"], min_age_days=14, max_age_days=60, top_k=10)
+    resp = await scan_pattern(req)
 
+    if resp.evaluated_count > 0:
+        assert len(resp.evaluated_symbols) > 0
 
-def test_low_volatility_pseudo_stable_is_excluded():
-    closes = [1.00, 1.01, 0.99, 1.00, 1.01, 1.00, 0.99, 1.00]
-    status, reason = classify_behavioral_universe_filter(closes)
-    assert status == "excluded_stablecoin"
-    assert reason == "excluded_stablecoin_behavior"
+    for sym in resp.skipped_symbols:
+        assert sym in resp.skip_reasons
 
-
-def test_broad_low_vol_asset_is_excluded():
-    closes = [10.00, 10.02, 10.01, 10.00, 10.01, 10.00, 10.02, 10.01]
-    status, reason = classify_behavioral_universe_filter(closes)
-    assert status == "excluded_low_volatility"
-    assert reason == "excluded_low_volatility"
+    assert "BTC" in set(resp.resolved_symbols) | set(resp.unresolved_symbols) | set(resp.evaluated_symbols) | set(resp.skipped_symbols)

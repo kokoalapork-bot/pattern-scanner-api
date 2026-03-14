@@ -199,7 +199,10 @@ def compute_exemplar_metrics(breakdown) -> dict[str, float | bool]:
         "distance_to_siren_breakdown": round(distance_to_siren, 4),
         "distance_to_river_breakdown": round(distance_to_river, 4),
         "reference_band_passed": reference_band_passed,
-    }def compute_pre_breakout_guardrails(
+    }
+
+
+def compute_pre_breakout_guardrails(
     *,
     breakdown_dict: dict[str, float],
     stage: str,
@@ -390,7 +393,10 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int):
         return None
 
     best["candidate_windows_count"] = candidate_windows_count
-    return bestdef build_symbol_index(markets: list[dict]) -> Dict[str, list[dict]]:
+    return best
+
+
+def build_symbol_index(markets: list[dict]) -> Dict[str, list[dict]]:
     index: Dict[str, list[dict]] = {}
     for coin in markets:
         symbol = str(coin.get("symbol", "")).lower()
@@ -560,7 +566,10 @@ def merge_coin_candidates(existing: list[dict], new_coin: dict) -> list[dict]:
     seen = {str(c.get("id", "")).lower() for c in existing}
     if coin_id in seen:
         return existing
-    return existing + [new_coin]def mark_skipped(
+    return existing + [new_coin]
+
+
+def mark_skipped(
     asset_key: str,
     coingecko_id: str | None,
     reason: str,
@@ -752,7 +761,10 @@ def to_compact_scan_result(result: ScanResult) -> CompactScanResult:
         name=result.name,
         similarity=result.similarity,
         label=result.label,
-    )async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
+    )
+
+
+async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
     if req.min_age_days > req.max_age_days:
         raise HTTPException(status_code=400, detail="min_age_days must be <= max_age_days")
 
@@ -926,7 +938,9 @@ def to_compact_scan_result(result: ScanResult) -> CompactScanResult:
                     universe_filter_status="included_for_scoring",
                     universe_filter_reason="included_for_scoring",
                 )
-                continuepre_universe_status, pre_universe_reason = classify_universe_filter_from_market(coin)
+                continue
+
+            pre_universe_status, pre_universe_reason = classify_universe_filter_from_market(coin)
             if pre_universe_status != "included_for_scoring":
                 mark_skipped(
                     asset_key=asset_key,
@@ -1123,7 +1137,9 @@ def to_compact_scan_result(result: ScanResult) -> CompactScanResult:
                 auth_header_name=fetch.auth_header_name,
                 universe_filter_status="included_for_scoring",
                 universe_filter_reason="included_for_scoring",
-            )try:
+            )
+
+            try:
                 best = find_best_window(closes, req.min_age_days, min(req.max_age_days, len(closes)))
             except ScoringError as e:
                 mark_skipped(

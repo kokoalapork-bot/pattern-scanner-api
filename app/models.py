@@ -1,9 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/app/models.py b/app/models.py
-index c36f324acb09e2e08e2bd5e75b571ca10fd3c54c..431477806b856db555ae1c3154f66f5aff35e826 100644
---- a/app/models.py
-+++ b/app/models.py
-@@ -1,77 +1,82 @@
  from typing import Literal, Optional, Dict, Any
  from pydantic import BaseModel, Field, ConfigDict
  

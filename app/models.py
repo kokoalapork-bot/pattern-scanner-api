@@ -1,84 +1,176 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from typing import Literal, Optional, Dict, Any
+from pydantic import BaseModel, Field, ConfigDict
 
-from .config import settings
-from .data_sources import build_coingecko_auth
-from .models import ErrorResponse, ScanRequest, ScanResponse
-from .services import scan_pattern
-
-BASE_URL = "https://pattern-scanner-api.onrender.com"
+PatternName = Literal["crown_shelf_right_spike"]
 
 
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-    version: str
-
-
-class RootResponse(BaseModel):
-    message: str
-    docs: str
-    health: str
-    openapi: str
-    default_min_age_days: int
-    default_max_age_days: int
-
-
-app = FastAPI(
-    title="Crypto Pattern Scanner API",
-    version="1.0.0",
-    description=(
-        "Scans crypto assets for the crown-shelf-right-spike base structure. "
-        "Supports both symbol-based resolution and direct CoinGecko ids."
-    ),
-    servers=[{"url": BASE_URL}],
-)
-
-
-@app.on_event("startup")
-async def validate_integrations() -> None:
-    build_coingecko_auth()
-
-
-@app.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
-    return HealthResponse(
-        status="ok",
-        service="crypto-pattern-scanner",
-        version="1.0.0",
+class ScanRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "pattern_name": "crown_shelf_right_spike",
+                    "min_age_days": 14,
+                    "max_age_days": 90,
+                    "top_k": 10,
+                    "max_coins_to_evaluate": 20,
+                    "vs_currency": "usd",
+                    "include_notes": True,
+                    "market_offset": 0,
+                    "market_batch_size": 20,
+                    "return_pre_filter_candidates": True,
+                },
+                {
+                    "pattern_name": "crown_shelf_right_spike",
+                    "min_age_days": 14,
+                    "max_age_days": 90,
+                    "top_k": 10,
+                    "max_coins_to_evaluate": 10,
+                    "vs_currency": "usd",
+                    "include_notes": True,
+                    "coingecko_ids": ["stakestone", "river", "siren-2"],
+                },
+            ]
+        }
     )
 
+    pattern_name: PatternName = "crown_shelf_right_spike"
+    min_age_days: int = Field(default=14, ge=1, le=5000)
+    max_age_days: int = Field(default=450, ge=1, le=5000)
+    top_k: int = Field(default=20, ge=1, le=100)
+    max_coins_to_evaluate: int = Field(default=80, ge=1, le=500)
+    vs_currency: str = Field(default="usd")
+    include_notes: bool = True
+    debug: bool = False
 
-@app.post(
-    "/scan",
-    response_model=ScanResponse,
-    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
-    summary="Scan assets by symbols and/or coingecko_ids",
-)
-async def scan(req: ScanRequest):
-    if req.top_k > req.max_coins_to_evaluate:
-        return JSONResponse(
-            status_code=400,
-            content={"detail": "top_k cannot be greater than max_coins_to_evaluate"},
-        )
+    symbols: Optional[list[str]] = Field(default=None)
+    coingecko_ids: Optional[list[str]] = Field(default=None)
+    exclude_symbols: Optional[list[str]] = Field(default=None)
 
-    if not req.symbols and not req.coingecko_ids and req.max_coins_to_evaluate < 1:
-        return JSONResponse(
-            status_code=400,
-            content={"detail": "Provide symbols, coingecko_ids, or a positive max_coins_to_evaluate"},
-        )
-
-    return await scan_pattern(req)
+    market_offset: int = Field(default=0, ge=0)
+    market_batch_size: Optional[int] = Field(default=None, ge=1, le=500)
+    return_pre_filter_candidates: bool = True
+    compact_response: bool = True
 
 
-@app.get("/", response_model=RootResponse)
-async def root() -> RootResponse:
-    return RootResponse(
-        message="Crypto Pattern Scanner API",
-        docs="/docs",
-        health="/health",
-        openapi="/openapi.json",
-        default_min_age_days=settings.default_min_age_days,
-        default_max_age_days=settings.default_max_age_days,
-    )
+class MatchBreakdown(BaseModel):
+    crown: float
+    drop: float
+    shelf: float
+    right_spike: float
+    reversion: float
+    asymmetry: float
+    template_shape: float
+
+
+class BestWindow(BaseModel):
+    start_idx: int
+    end_idx: int
+    length_days: int
+    best_age_days: int
+    candidate_windows_count: int
+
+
+class DebugSymbolInfo(BaseModel):
+    input_symbol: str | None = None
+    input_coingecko_id: str | None = None
+    source_type: str | None = None
+
+    resolved: bool = False
+    coingecko_id: str | None = None
+    status: str = "unknown"
+    stage: str = "unknown"
+    reason: str | None = None
+
+    endpoint: str | None = None
+    http_status: int | None = None
+    request_params: Dict[str, Any] | None = None
+    error_message: str | None = None
+
+    auth_mode: str | None = None
+    base_url: str | None = None
+    api_key_present: bool | None = None
+    auth_header_name: str | None = None
+
+    universe_filter_status: str | None = None
+    universe_filter_reason: str | None = None
+
+    candidate_windows_count: int | None = None
+    best_window: Dict[str, Any] | None = None
+
+    structural_score: float | None = None
+    exemplar_consistency_score: float | None = None
+    distance_to_siren_breakdown: float | None = None
+    distance_to_river_breakdown: float | None = None
+    reference_band_passed: bool | None = None
+    pre_breakout_base_score: float | None = None
+
+    raw_similarity: float | None = None
+    label: str | None = None
+
+
+class ScanResult(BaseModel):
+    coingecko_id: str
+    symbol: str
+    name: str
+    age_days: int
+    market_cap_usd: float | None = None
+    volume_24h_usd: float | None = None
+
+    similarity: float
+    raw_similarity: float
+    label: str
+    label_before_final_gate: str | None = None
+    stage: str
+
+    structural_score: float
+    exemplar_consistency_score: float
+    distance_to_siren_breakdown: float
+    distance_to_river_breakdown: float
+    reference_band_passed: bool
+    pre_breakout_base_score: float | None = None
+
+    universe_filter_status: str
+    universe_filter_reason: str
+
+    breakdown: MatchBreakdown
+    best_window: BestWindow
+
+    notes: list[str] = Field(default_factory=list)
+    source: str = "coingecko"
+
+
+class ScanResponse(BaseModel):
+    pattern_name: PatternName
+
+    evaluated_count: int
+    returned_count: int
+
+    resolved_symbols: list[str] = Field(default_factory=list)
+    unresolved_symbols: list[str] = Field(default_factory=list)
+
+    resolved_coingecko_ids: list[str] = Field(default_factory=list)
+    invalid_coingecko_ids: list[str] = Field(default_factory=list)
+
+    evaluated_symbols: list[str] = Field(default_factory=list)
+    skipped_symbols: list[str] = Field(default_factory=list)
+
+    evaluated_assets: list[str] = Field(default_factory=list)
+    skipped_assets: list[str] = Field(default_factory=list)
+
+    universe_source: str = "coingecko_markets"
+    universe_total_count: int = 0
+    universe_filtered_count: int = 0
+    market_offset: int = 0
+    market_batch_size: int = 0
+    market_batch_ids: list[str] = Field(default_factory=list)
+
+    skip_reasons: Dict[str, str] = Field(default_factory=dict)
+    debug_by_symbol: Dict[str, DebugSymbolInfo] = Field(default_factory=dict)
+
+    results: list[ScanResult]
+    pre_filter_candidates: list[ScanResult] = Field(default_factory=list)
+
+
+class ErrorResponse(BaseModel):
+    detail: str

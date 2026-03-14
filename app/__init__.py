@@ -1,1 +1,1 @@
-"""Crypto Pattern Scanner app package."""
+"""app package."""

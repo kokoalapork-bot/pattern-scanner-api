@@ -1,350 +1,758 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+import asyncio
 import math
+from time import monotonic
+
+import httpx
+
+from .config import settings
+
+TOKENIZED_STOCK_KEYWORDS = [
+    "tokenized stock",
+    "tokenized etf",
+    "xstock",
+    "ondo",
+    "tesla",
+    "alphabet",
+    "nvidia",
+    "meta",
+    "micron",
+    "sp500",
+    "nasdaq",
+    "ishares",
+    "silver trust",
+    "gold",
+]
+
+MAJOR_EXCLUDED_SYMBOLS = {"btc", "eth"}
+MAJOR_EXCLUDED_IDS = {"bitcoin", "ethereum"}
+
+STABLE_SYMBOLS = {
+    "usdt", "usdc", "dai", "fdusd", "tusd", "gusd", "frax", "frxusd",
+    "usdh", "dusd", "usdon", "fidd", "usde", "pyusd", "eurc", "eurs",
+    "susd", "usdp", "lusd", "rlusd", "usdm", "usdx", "eurt", "celo-dollar",
+}
+
+STABLE_IDS = {
+    "tether",
+    "usd-coin",
+    "dai",
+    "first-digital-usd",
+    "true-usd",
+    "gemini-dollar",
+    "frax",
+    "frax-price-index-share",
+    "paypal-usd",
+    "usde",
+    "pax-dollar",
+    "stasis-eurs",
+    "celo-dollar",
+    "ethena-usde",
+    "curve-fi-amdai-amusdc-amusdt",
+}
+
+STABLE_NAME_KEYWORDS = [
+    "stablecoin",
+    "wrapped usd",
+    "synthetic dollar",
+    "synthetic usd",
+    "yield usd",
+    "yield-bearing usd",
+    "euro stable",
+    "usd coin",
+    "digital dollar",
+    "dollar",
+    "euro coin",
+]
+
+DEMO_HISTORY_MAX_DAYS = 365
 
 
-def _mean(xs: List[float]) -> float:
+CACHE_TTL_SECONDS = 300.0
+_MARKETS_CACHE: dict[tuple[str, int, int], tuple[float, list[dict[str, Any]]]] = {}
+_COIN_SNAPSHOT_CACHE: dict[tuple[str, str], tuple[float, CoinSnapshotFetchResult]] = {}
+_MARKET_CHART_CACHE: dict[tuple[str, str, str, str], tuple[float, MarketDataFetchResult]] = {}
+
+
+class CoinGeckoConfigError(RuntimeError):
+    pass
+
+
+@dataclass
+class MarketDataFetchResult:
+    ok: bool
+    reason: str | None = None
+    chart: dict[str, Any] | None = None
+    error_message: str | None = None
+    endpoint: str | None = None
+    http_status: int | None = None
+    request_params: Dict[str, Any] | None = None
+    auth_mode: str | None = None
+    base_url: str | None = None
+    api_key_present: bool | None = None
+    auth_header_name: str | None = None
+
+
+@dataclass
+class CoinSnapshotFetchResult:
+    ok: bool
+    reason: str | None = None
+    coin: dict[str, Any] | None = None
+    error_message: str | None = None
+    endpoint: str | None = None
+    http_status: int | None = None
+    request_params: Dict[str, Any] | None = None
+    auth_mode: str | None = None
+    base_url: str | None = None
+    api_key_present: bool | None = None
+    auth_header_name: str | None = None
+
+
+@dataclass(frozen=True)
+class CoinGeckoAuth:
+    mode: str
+    base_url: str
+    header_name: str
+    api_key: str
+    api_key_present: bool
+
+
+
+
+def _cache_get(cache: dict, key: tuple, ttl_seconds: float):
+    row = cache.get(key)
+    if not row:
+        return None
+    ts, value = row
+    if (monotonic() - ts) > ttl_seconds:
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(cache: dict, key: tuple, value):
+    cache[key] = (monotonic(), value)
+
+def build_coingecko_auth() -> CoinGeckoAuth:
+    auth_mode = settings.coingecko_auth_mode
+    api_key = settings.coingecko_api_key.strip()
+    base_url = settings.coingecko_effective_base_url.rstrip("/")
+    header_name = settings.coingecko_header_name
+
+    if not api_key:
+        raise CoinGeckoConfigError("COINGECKO_API_KEY is missing or blank")
+
+    if auth_mode == "demo":
+        if "pro-api.coingecko.com" in base_url:
+            raise CoinGeckoConfigError("demo mode cannot use pro-api base URL")
+        if header_name != "x-cg-demo-api-key":
+            raise CoinGeckoConfigError("demo mode must use x-cg-demo-api-key")
+    elif auth_mode == "pro":
+        if "pro-api.coingecko.com" not in base_url:
+            raise CoinGeckoConfigError("pro mode must use pro-api base URL")
+        if header_name != "x-cg-pro-api-key":
+            raise CoinGeckoConfigError("pro mode must use x-cg-pro-api-key")
+    else:
+        raise CoinGeckoConfigError(f"Unsupported auth mode: {auth_mode}")
+
+    return CoinGeckoAuth(
+        mode=auth_mode,
+        base_url=base_url,
+        header_name=header_name,
+        api_key=api_key,
+        api_key_present=True,
+    )
+
+
+def get_history_plan_limit_days(auth_mode: str) -> int | None:
+    if auth_mode == "demo":
+        return DEMO_HISTORY_MAX_DAYS
+    return None
+
+
+def _mean(xs: list[float]) -> float:
     return sum(xs) / len(xs) if xs else 0.0
 
 
-def _stdev(xs: List[float]) -> float:
+def _stdev(xs: list[float]) -> float:
     if len(xs) < 2:
         return 0.0
     m = _mean(xs)
     return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
 
 
-def _minmax_scale(xs: List[float]) -> List[float]:
-    if not xs:
-        return []
-    lo, hi = min(xs), max(xs)
-    if hi <= lo:
-        return [0.5 for _ in xs]
-    return [(x - lo) / (hi - lo) for x in xs]
+def looks_like_major(symbol: str, coingecko_id: str) -> tuple[bool, str | None]:
+    s = symbol.lower()
+    cid = coingecko_id.lower()
+
+    if s == "btc" or cid == "bitcoin":
+        return True, "excluded_btc"
+    if s == "eth" or cid == "ethereum":
+        return True, "excluded_eth"
+    if s in MAJOR_EXCLUDED_SYMBOLS or cid in MAJOR_EXCLUDED_IDS:
+        return True, "excluded_major"
+    return False, None
 
 
-def _smooth(xs: List[float], window: int = 5) -> List[float]:
-    if window <= 1 or len(xs) <= 2:
-        return xs[:]
-    out: List[float] = []
-    r = window // 2
-    for i in range(len(xs)):
-        lo = max(0, i - r)
-        hi = min(len(xs), i + r + 1)
-        out.append(_mean(xs[lo:hi]))
-    return out
+def looks_like_stable(symbol: str, name: str, coingecko_id: str | None = None) -> bool:
+    s = symbol.lower()
+    n = name.lower()
+    cid = (coingecko_id or "").lower()
+
+    if s in STABLE_SYMBOLS:
+        return True
+    if cid in STABLE_IDS:
+        return True
+    if " usd" in n or n.endswith(" usd") or "stable" in n:
+        return True
+    return any(keyword in n for keyword in STABLE_NAME_KEYWORDS)
 
 
-def _local_peaks(xs: List[float], min_prominence: float = 0.02) -> List[int]:
-    peaks: List[int] = []
-    n = len(xs)
-    if n < 3:
-        return peaks
-    for i in range(1, n - 1):
-        if xs[i] > xs[i - 1] and xs[i] > xs[i + 1]:
-            left = xs[i] - xs[i - 1]
-            right = xs[i] - xs[i + 1]
-            if max(left, right) >= min_prominence:
-                peaks.append(i)
-    return peaks
+def looks_like_tokenized_stock(name: str) -> bool:
+    n = name.lower()
+    return any(keyword in n for keyword in TOKENIZED_STOCK_KEYWORDS)
 
 
-def _resample(xs: List[float], target: int = 120) -> List[float]:
-    if not xs:
-        return []
-    if len(xs) == target:
-        return xs[:]
-    if len(xs) == 1:
-        return [xs[0]] * target
-    out: List[float] = []
-    for i in range(target):
-        pos = i * (len(xs) - 1) / (target - 1)
-        left = int(math.floor(pos))
-        right = min(len(xs) - 1, left + 1)
-        t = pos - left
-        out.append(xs[left] * (1 - t) + xs[right] * t)
-    return out
+def price_behavior_metrics(closes: list[float]) -> dict[str, float]:
+    if not closes:
+        return {"mean": 0.0, "stdev": 0.0, "cv": 0.0, "range_ratio": 0.0}
+
+    avg = _mean(closes)
+    sd = _stdev(closes)
+    lo = min(closes)
+    hi = max(closes)
+    cv = 0.0 if avg == 0 else sd / avg
+    range_ratio = 0.0 if avg == 0 else (hi - lo) / avg
+
+    return {
+        "mean": avg,
+        "stdev": sd,
+        "cv": cv,
+        "range_ratio": range_ratio,
+    }
 
 
-@dataclass
-class PatternBreakdown:
-    crown: float
-    drop: float
-    shelf: float
-    right_spike: float
-    reversion: float
-    asymmetry: float
-    template_shape: float
+def classify_behavioral_universe_filter(closes: list[float]) -> tuple[str, str]:
+    metrics = price_behavior_metrics(closes)
+    avg = metrics["mean"]
+    cv = metrics["cv"]
+    range_ratio = metrics["range_ratio"]
+
+    near_peg = abs(avg - settings.stable_price_peg_center) <= settings.stable_price_peg_tolerance
+
+    if near_peg and cv <= settings.stable_max_cv and range_ratio <= settings.stable_max_range_ratio:
+        return "excluded_stablecoin", "excluded_stablecoin_behavior"
+
+    if cv <= settings.low_volatility_max_cv and range_ratio <= settings.low_volatility_max_range_ratio:
+        return "excluded_low_volatility", "excluded_low_volatility"
+
+    return "included_for_scoring", "included_for_scoring"
 
 
-@dataclass
-class PatternResult:
-    similarity: float
-    label: str
-    stage: str
-    breakdown: PatternBreakdown
-    notes: List[str]
-
-
-class CrownShelfRightSpikeScorer:
-    """
-    crown -> shelf -> right spike -> reversion to shelf
-
-    Цели:
-    - мягкий crown detector
-    - partial matches не пропадают
-    - SIREN / RIVER не должны валиться в crown=0 почти всегда
-    """
-
-    def __init__(self, debug: bool = False):
-        self.debug = debug
-
-    def score(self, prices: List[float]) -> PatternResult:
-        xs = _resample(prices, 120)
-        xs = _smooth(xs, 5)
-        xs = _minmax_scale(xs)
-
-        crown_zone = xs[:42]       # 0-35%
-        shelf_zone = xs[42:90]     # 35-75%
-        spike_zone = xs[90:108]    # 75-90%
-        revert_zone = xs[108:]     # 90-100%
-
-        crown_score, crown_notes = self._score_crown(crown_zone)
-        drop_score, drop_notes = self._score_drop(crown_zone, shelf_zone)
-        shelf_score, shelf_notes = self._score_shelf(shelf_zone)
-        spike_score, spike_notes = self._score_right_spike(shelf_zone, spike_zone)
-        reversion_score, reversion_notes = self._score_reversion(shelf_zone, spike_zone, revert_zone)
-        asymmetry_score, asymmetry_notes = self._score_asymmetry(crown_zone, spike_zone)
-        template_shape_score, template_notes = self._score_template_shape(xs)
-
-        similarity = (
-            0.18 * crown_score +
-            0.14 * drop_score +
-            0.24 * shelf_score +
-            0.20 * spike_score +
-            0.14 * reversion_score +
-            0.05 * asymmetry_score +
-            0.05 * template_shape_score
-        ) * 100.0
-
-        backbone = (shelf_score + spike_score + reversion_score) / 3.0
-
-        if crown_score < 0.15 and backbone >= 0.55:
-            label = "weak-crown variant"
-        elif similarity >= 65:
-            label = "strong match"
-        elif similarity >= 45:
-            label = "partial match"
-        else:
-            label = "weak match"
-
-        stage, stage_notes = self._classify_stage(
-            xs=xs,
-            shelf_zone=shelf_zone,
-            spike_zone=spike_zone,
-            revert_zone=revert_zone,
-            similarity=similarity,
-            shelf_score=shelf_score,
-            spike_score=spike_score,
-            reversion_score=reversion_score,
+class CoinGeckoClient:
+    def __init__(self) -> None:
+        self.auth = build_coingecko_auth()
+        self.client = httpx.AsyncClient(
+            base_url=self.auth.base_url,
+            headers={
+                "accept": "application/json",
+                "user-agent": "crypto-pattern-scanner/1.0",
+                self.auth.header_name: self.auth.api_key,
+            },
+            timeout=settings.request_timeout_seconds,
         )
 
-        notes = (
-            crown_notes
-            + drop_notes
-            + shelf_notes
-            + spike_notes
-            + reversion_notes
-            + asymmetry_notes
-            + template_notes
-            + stage_notes
-        )
+    async def close(self) -> None:
+        await self.client.aclose()
 
-        return PatternResult(
-            similarity=round(similarity, 2),
-            label=label,
-            stage=stage,
-            breakdown=PatternBreakdown(
-                crown=round(crown_score, 4),
-                drop=round(drop_score, 4),
-                shelf=round(shelf_score, 4),
-                right_spike=round(spike_score, 4),
-                reversion=round(reversion_score, 4),
-                asymmetry=round(asymmetry_score, 4),
-                template_shape=round(template_shape_score, 4),
-            ),
-            notes=notes,
-        )
+    def auth_debug(self) -> dict[str, Any]:
+        return {
+            "auth_mode": self.auth.mode,
+            "base_url": self.auth.base_url,
+            "api_key_present": self.auth.api_key_present,
+            "auth_header_name": self.auth.header_name,
+        }
 
-    def _score_crown(self, crown_zone: List[float]) -> Tuple[float, List[str]]:
-        peaks = _local_peaks(crown_zone, min_prominence=0.02)
-        top = max(crown_zone) if crown_zone else 0.0
-        avg = _mean(crown_zone)
-        vol = _stdev(crown_zone)
+    def normalize_history_days(self, requested_days: int | str) -> tuple[int, bool]:
+        try:
+            days_int = int(requested_days)
+        except Exception:
+            days_int = 365
 
-        peak_count_score = min(1.0, len(peaks) / 3.0)
-        crest_score = max(0.0, min(1.0, (top - avg) / 0.20))
-        texture_score = max(0.0, min(1.0, vol / 0.11))
+        plan_limit = get_history_plan_limit_days(self.auth.mode)
+        if plan_limit is not None and days_int > plan_limit:
+            return plan_limit, True
+        return days_int, False
 
-        score = 0.45 * peak_count_score + 0.35 * crest_score + 0.20 * texture_score
-
-        notes: List[str] = []
-        if score >= 0.65:
-            notes.append("Левая корона читается достаточно хорошо.")
-        elif score >= 0.35:
-            notes.append("Левая корона присутствует, но выражена мягко.")
-        else:
-            notes.append("Левая корона выражена слабо.")
-        return score, notes
-
-    def _score_drop(self, crown_zone: List[float], shelf_zone: List[float]) -> Tuple[float, List[str]]:
-        if not crown_zone or not shelf_zone:
-            return 0.0, ["Падение из короны в полку не удалось оценить."]
-        crown_high = max(crown_zone)
-        shelf_mid = _mean(shelf_zone)
-        drop = max(0.0, crown_high - shelf_mid)
-        score = max(0.0, min(1.0, drop / 0.35))
-
-        if score >= 0.55:
-            return score, ["Снижение из левой зоны в полку читается хорошо."]
-        if score >= 0.25:
-            return score, ["Снижение из левой зоны в полку умеренное."]
-        return score, ["Падение из короны в полку выражено слабо."]
-
-    def _score_shelf(self, shelf_zone: List[float]) -> Tuple[float, List[str]]:
-        if not shelf_zone:
-            return 0.0, ["Полку не удалось оценить."]
-        vol = _stdev(shelf_zone)
-        slope = abs(_mean(shelf_zone[-8:]) - _mean(shelf_zone[:8])) if len(shelf_zone) >= 16 else 0.0
-
-        flatness = max(0.0, 1.0 - min(1.0, vol / 0.09))
-        levelness = max(0.0, 1.0 - min(1.0, slope / 0.12))
-        score = 0.65 * flatness + 0.35 * levelness
-
-        if score >= 0.70:
-            return score, ["Есть длинная и достаточно ровная средняя полка."]
-        if score >= 0.40:
-            return score, ["Полка присутствует, но не совсем плоская."]
-        return score, ["Средняя полка слабая или слишком шумная."]
-
-    def _score_right_spike(self, shelf_zone: List[float], spike_zone: List[float]) -> Tuple[float, List[str]]:
-        if not shelf_zone or not spike_zone:
-            return 0.0, ["Правый шпиль не удалось оценить."]
-        shelf_mid = _mean(shelf_zone)
-        spike_top = max(spike_zone)
-        spike_gain = max(0.0, spike_top - shelf_mid)
-        spike_narrowness = max(0.0, 1.0 - min(1.0, _stdev(spike_zone) / 0.18))
-        raw_height = max(0.0, min(1.0, spike_gain / 0.30))
-        score = 0.75 * raw_height + 0.25 * spike_narrowness
-
-        if score >= 0.75:
-            return score, ["Правый шпиль выражен хорошо и визуально отделен от полки."]
-        if score >= 0.45:
-            return score, ["Правый выступ есть, но он умеренный."]
-        return score, ["Правый выступ слабый или размазан."]
-
-    def _score_reversion(
+    async def get_markets(
         self,
-        shelf_zone: List[float],
-        spike_zone: List[float],
-        revert_zone: List[float],
-    ) -> Tuple[float, List[str]]:
-        if not shelf_zone or not spike_zone or not revert_zone:
-            return 0.0, ["Возврат в полку не удалось оценить."]
+        vs_currency: str = "usd",
+        pages: int = 3,
+        per_page: int = 250,
+    ) -> list[dict[str, Any]]:
+        cache_key = (vs_currency, int(pages), int(per_page))
+        cached = _cache_get(_MARKETS_CACHE, cache_key, CACHE_TTL_SECONDS)
+        if cached is not None:
+            return [dict(item) for item in cached]
 
-        shelf_mid = _mean(shelf_zone)
-        revert_mid = _mean(revert_zone)
-        dist_to_shelf = abs(revert_mid - shelf_mid)
-        shelf_rejoin = max(0.0, 1.0 - min(1.0, dist_to_shelf / 0.12))
+        items: list[dict[str, Any]] = []
 
-        spike_top = max(spike_zone)
-        spike_excess = max(0.0, spike_top - shelf_mid)
-        decay = max(0.0, spike_top - revert_mid)
-        decay_score = 0.0 if spike_excess <= 0 else max(0.0, min(1.0, decay / max(0.12, spike_excess)))
+        for page in range(1, pages + 1):
+            resp = await self.client.get(
+                "/coins/markets",
+                params={
+                    "vs_currency": vs_currency,
+                    "order": "market_cap_desc",
+                    "per_page": per_page,
+                    "page": page,
+                    "sparkline": "false",
+                    "price_change_percentage": "24h,7d",
+                },
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, list):
+                raise ValueError("CoinGecko /coins/markets returned non-list payload")
+            items.extend(payload)
 
-        score = 0.65 * shelf_rejoin + 0.35 * decay_score
+        _cache_set(_MARKETS_CACHE, cache_key, items)
+        return [dict(item) for item in items]
 
-        if score >= 0.70:
-            return score, ["После шпиля есть возврат в боковик."]
-        if score >= 0.40:
-            return score, ["После шпиля возврат в полку умеренный."]
-        return score, ["После шпиля возврат в полку выражен слабо."]
+    async def fetch_coin_snapshot_safe(self, coingecko_id: str, vs_currency: str = "usd") -> CoinSnapshotFetchResult:
+        endpoint = f"/coins/{coingecko_id}"
+        request_params = {
+            "localization": "false",
+            "tickers": "false",
+            "market_data": "true",
+            "community_data": "false",
+            "developer_data": "false",
+            "sparkline": "false",
+        }
 
-    def _score_asymmetry(self, crown_zone: List[float], spike_zone: List[float]) -> Tuple[float, List[str]]:
-        if not crown_zone or not spike_zone:
-            return 0.0, ["Асимметрию формы не удалось оценить."]
-        left_height = max(crown_zone) - min(crown_zone)
-        right_height = max(spike_zone) - min(spike_zone)
-        ratio = right_height / max(1e-9, left_height)
-        score = 1.0 - min(1.0, abs(ratio - 1.0) / 1.5)
+        cache_key = (str(coingecko_id).lower(), vs_currency)
+        cached = _cache_get(_COIN_SNAPSHOT_CACHE, cache_key, CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
 
-        if score >= 0.60:
-            return score, ["Левая и правая части формы соразмерны."]
-        return score, ["Баланс левой и правой части формы средний."]
+        try:
+            resp = await self.client.get(endpoint, params=request_params)
+            resp.raise_for_status()
+            payload = resp.json()
 
-    def _score_template_shape(self, xs: List[float]) -> Tuple[float, List[str]]:
-        if not xs:
-            return 0.0, ["Силуэт не удалось оценить."]
+            if not isinstance(payload, dict):
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="coin_snapshot_bad_response_schema",
+                    error_message=f"snapshot is not a dict: {type(payload).__name__}",
+                    endpoint="/coins/{id}",
+                    http_status=200,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
 
-        crown = _mean(xs[:30])
-        shelf = _mean(xs[45:85])
-        spike = max(xs[92:108]) if len(xs) >= 108 else max(xs)
-        revert = _mean(xs[108:]) if len(xs) > 108 else xs[-1]
+            symbol = str(payload.get("symbol") or "").strip()
+            coin_id = str(payload.get("id") or "").strip()
+            name = str(payload.get("name") or "").strip()
 
-        cond1 = max(0.0, min(1.0, (crown - shelf + 0.08) / 0.25))
-        cond2 = max(0.0, min(1.0, (spike - shelf) / 0.30))
-        cond3 = max(0.0, 1.0 - min(1.0, abs(revert - shelf) / 0.12))
+            if not coin_id:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="coin_snapshot_bad_response_schema",
+                    error_message="missing id in /coins/{id} response",
+                    endpoint="/coins/{id}",
+                    http_status=200,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
 
-        score = 0.35 * cond1 + 0.35 * cond2 + 0.30 * cond3
+            market_data = payload.get("market_data") or {}
+            market_cap = None
+            total_volume = None
+            if isinstance(market_data, dict):
+                market_cap = ((market_data.get("market_cap") or {}).get(vs_currency))
+                total_volume = ((market_data.get("total_volume") or {}).get(vs_currency))
 
-        if score >= 0.65:
-            return score, ["Общий силуэт хорошо похож на эталон."]
-        if score >= 0.40:
-            return score, ["Общий силуэт умеренно похож на эталон."]
-        return score, ["Силуэт заметно отклоняется от эталона."]
+            coin = {
+                "id": coin_id,
+                "symbol": symbol,
+                "name": name or coin_id,
+                "market_cap": market_cap,
+                "total_volume": total_volume,
+            }
 
-    def _classify_stage(
+            result = CoinSnapshotFetchResult(
+                ok=True,
+                coin=coin,
+                endpoint="/coins/{id}",
+                http_status=200,
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+            _cache_set(_COIN_SNAPSHOT_CACHE, cache_key, result)
+            return result
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            body_text = ""
+            try:
+                body_text = e.response.text[:500]
+            except Exception:
+                body_text = ""
+            error_message = str(e) if not body_text else f"{str(e)} | body={body_text}"
+
+            if status == 404:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="invalid_coingecko_id",
+                    error_message=error_message,
+                    endpoint="/coins/{id}",
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            if status == 401:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="coin_snapshot_http_401",
+                    error_message=error_message,
+                    endpoint="/coins/{id}",
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            if status == 403:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="coin_snapshot_http_403",
+                    error_message=error_message,
+                    endpoint="/coins/{id}",
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            if status == 429:
+                return CoinSnapshotFetchResult(
+                    ok=False,
+                    reason="rate_limited",
+                    error_message=error_message,
+                    endpoint="/coins/{id}",
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            return CoinSnapshotFetchResult(
+                ok=False,
+                reason="coin_snapshot_http_error",
+                error_message=error_message,
+                endpoint="/coins/{id}",
+                http_status=status,
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+
+        except httpx.TimeoutException as e:
+            return CoinSnapshotFetchResult(
+                ok=False,
+                reason="timeout",
+                error_message=str(e),
+                endpoint="/coins/{id}",
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+
+        except httpx.RequestError as e:
+            return CoinSnapshotFetchResult(
+                ok=False,
+                reason="network_error",
+                error_message=str(e),
+                endpoint="/coins/{id}",
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+
+        except Exception as e:
+            return CoinSnapshotFetchResult(
+                ok=False,
+                reason="coin_snapshot_failed",
+                error_message=f"{type(e).__name__}: {e}",
+                endpoint="/coins/{id}",
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+
+    async def fetch_market_history(
         self,
-        xs: List[float],
-        shelf_zone: List[float],
-        spike_zone: List[float],
-        revert_zone: List[float],
-        similarity: float,
-        shelf_score: float,
-        spike_score: float,
-        reversion_score: float,
-    ) -> Tuple[str, List[str]]:
-        notes: List[str] = []
+        coingecko_id: str,
+        vs_currency: str = "usd",
+        days: int | str = 450,
+        interval: str = "daily",
+    ) -> MarketDataFetchResult:
+        normalized_days, capped = self.normalize_history_days(days)
 
-        shelf_mid = _mean(shelf_zone) if shelf_zone else 0.0
-        spike_top = max(spike_zone) if spike_zone else shelf_mid
-        revert_mid = _mean(revert_zone) if revert_zone else shelf_mid
-        last_tail = _mean(xs[-8:]) if len(xs) >= 8 else xs[-1]
+        if not coingecko_id:
+            return MarketDataFetchResult(
+                ok=False,
+                reason="coingecko_id_missing",
+                endpoint="/coins/{id}/market_chart",
+                request_params={
+                    "vs_currency": vs_currency,
+                    "days": str(normalized_days),
+                    "interval": interval,
+                    "requested_days": str(days),
+                    "plan_limit_days": get_history_plan_limit_days(self.auth.mode),
+                    "days_capped_by_plan": capped,
+                },
+                **self.auth_debug(),
+            )
 
-        tail_distance = abs(last_tail - shelf_mid)
+        endpoint = f"/coins/{coingecko_id}/market_chart"
+        cache_key = (str(coingecko_id).lower(), str(vs_currency).lower(), str(normalized_days), str(interval).lower())
+        cached = _cache_get(_MARKET_CHART_CACHE, cache_key, CACHE_TTL_SECONDS)
+        if cached is not None:
+            return cached
+        request_params = {
+            "vs_currency": vs_currency,
+            "days": str(normalized_days),
+            "interval": interval,
+            "requested_days": str(days),
+            "plan_limit_days": get_history_plan_limit_days(self.auth.mode),
+            "days_capped_by_plan": capped,
+        }
 
-        if spike_score >= 0.45 and reversion_score >= 0.55 and tail_distance <= 0.10:
-            notes.append("Стадия: паттерн уже в основном отыгран.")
-            return "completed", notes
+        retries = max(1, settings.history_retry_count)
+        backoff_base = max(0.1, settings.history_backoff_base_seconds)
+        chart: Optional[dict[str, Any]] = None
 
-        if spike_score >= 0.45 and similarity >= 45 and tail_distance > 0.10:
-            notes.append("Стадия: паттерн еще активен и потенциально торгуем.")
-            return "active", notes
+        for attempt in range(retries):
+            try:
+                resp = await self.client.get(
+                    endpoint,
+                    params={
+                        "vs_currency": vs_currency,
+                        "days": str(normalized_days),
+                        "interval": interval,
+                    },
+                )
+                resp.raise_for_status()
+                payload = resp.json()
 
-        if shelf_score >= 0.45 and spike_score < 0.30:
-            notes.append("Стадия: паттерн еще формируется.")
-            return "forming", notes
+                if not isinstance(payload, dict):
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_bad_response_schema",
+                        error_message=f"chart is not a dict: {type(payload).__name__}",
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=200,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
 
-        if reversion_score >= 0.50:
-            notes.append("Стадия ближе к завершенной.")
-            return "completed", notes
+                prices = payload.get("prices")
+                if prices is None:
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_bad_response_schema",
+                        error_message="missing 'prices' field",
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=200,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
 
-        notes.append("Стадия ближе к активной.")
-        return "active", notes
+                if not isinstance(prices, list):
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_bad_response_schema",
+                        error_message="'prices' is not a list",
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=200,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                if len(prices) == 0:
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_empty",
+                        error_message="prices list is empty",
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=200,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                chart = payload
+                break
+
+            except httpx.TimeoutException as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(backoff_base * (2 ** attempt))
+                    continue
+                return MarketDataFetchResult(
+                    ok=False,
+                    reason="timeout",
+                    error_message=str(e),
+                    endpoint="/coins/{id}/market_chart",
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                body_text = ""
+                try:
+                    body_text = e.response.text[:500]
+                except Exception:
+                    body_text = ""
+                error_message = str(e) if not body_text else f"{str(e)} | body={body_text}"
+
+                if status == 429:
+                    if attempt < retries - 1:
+                        await asyncio.sleep(backoff_base * (2 ** attempt))
+                        continue
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="rate_limited",
+                        error_message=error_message,
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=status,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                if status == 401:
+                    if self.auth.mode == "demo" and int(request_params["requested_days"]) > DEMO_HISTORY_MAX_DAYS:
+                        return MarketDataFetchResult(
+                            ok=False,
+                            reason="history_range_exceeds_plan_limit",
+                            error_message=(
+                                f"Demo plan requested {request_params['requested_days']} days, "
+                                f"plan limit is {DEMO_HISTORY_MAX_DAYS}. Upstream error: {error_message}"
+                            ),
+                            endpoint="/coins/{id}/market_chart",
+                            http_status=status,
+                            request_params=request_params,
+                            **self.auth_debug(),
+                        )
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_http_401",
+                        error_message=error_message,
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=status,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                if status == 403:
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_http_403",
+                        error_message=error_message,
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=status,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                if status == 404:
+                    return MarketDataFetchResult(
+                        ok=False,
+                        reason="history_http_404",
+                        error_message=error_message,
+                        endpoint="/coins/{id}/market_chart",
+                        http_status=status,
+                        request_params=request_params,
+                        **self.auth_debug(),
+                    )
+
+                if 500 <= status <= 599 and attempt < retries - 1:
+                    await asyncio.sleep(backoff_base * (2 ** attempt))
+                    continue
+
+                return MarketDataFetchResult(
+                    ok=False,
+                    reason="history_http_error",
+                    error_message=error_message,
+                    endpoint="/coins/{id}/market_chart",
+                    http_status=status,
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            except httpx.RequestError as e:
+                if attempt < retries - 1:
+                    await asyncio.sleep(backoff_base * (2 ** attempt))
+                    continue
+                return MarketDataFetchResult(
+                    ok=False,
+                    reason="network_error",
+                    error_message=str(e),
+                    endpoint="/coins/{id}/market_chart",
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+            except Exception as e:
+                return MarketDataFetchResult(
+                    ok=False,
+                    reason="history_fetch_failed",
+                    error_message=f"{type(e).__name__}: {e}",
+                    endpoint="/coins/{id}/market_chart",
+                    request_params=request_params,
+                    **self.auth_debug(),
+                )
+
+        if chart is None:
+            return MarketDataFetchResult(
+                ok=False,
+                reason="history_fetch_failed",
+                error_message="retry loop exhausted unexpectedly",
+                endpoint="/coins/{id}/market_chart",
+                request_params=request_params,
+                **self.auth_debug(),
+            )
+
+        result = MarketDataFetchResult(
+            ok=True,
+            chart=chart,
+            endpoint="/coins/{id}/market_chart",
+            http_status=200,
+            request_params=request_params,
+            **self.auth_debug(),
+        )
+        _cache_set(_MARKET_CHART_CACHE, cache_key, result)
+        return result
 
 
-def score_crown_shelf_right_spike(close: Iterable[float]) -> PatternResult:
-    scorer = CrownShelfRightSpikeScorer(debug=False)
-    return scorer.score(list(close))
+def coingecko_daily_closes(chart: dict[str, Any]) -> list[float]:
+    prices = chart.get("prices", [])
+    closes: list[float] = []
+    seen_days: set[str] = set()
+
+    for item in prices:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+
+        ts_ms, price = item[0], item[1]
+        try:
+            day_key = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            price_f = float(price)
+        except Exception:
+            continue
+
+        if day_key in seen_days:
+            closes[-1] = price_f
+        else:
+            seen_days.add(day_key)
+            closes.append(price_f)
+
+    return closes

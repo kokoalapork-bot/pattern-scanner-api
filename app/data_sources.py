@@ -77,10 +77,6 @@ _MARKETS_CACHE: dict[tuple[str, int, int], tuple[float, list[dict[str, Any]]]] =
 _COIN_SNAPSHOT_CACHE: dict[tuple[str, str], tuple[float, CoinSnapshotFetchResult]] = {}
 _MARKET_CHART_CACHE: dict[tuple[str, str, str, str], tuple[float, MarketDataFetchResult]] = {}
 
-_REQUEST_SEMAPHORE: asyncio.Semaphore | None = None
-_LAST_REQUEST_TS = 0.0
-_REQUEST_LOCK = asyncio.Lock()
-
 
 class CoinGeckoConfigError(RuntimeError):
     pass
@@ -140,28 +136,6 @@ def _cache_get(cache: dict, key: tuple, ttl_seconds: float):
 
 def _cache_set(cache: dict, key: tuple, value):
     cache[key] = (monotonic(), value)
-
-
-async def _wait_for_slot(min_pause_seconds: float) -> None:
-    global _LAST_REQUEST_TS
-    async with _REQUEST_LOCK:
-        now = monotonic()
-        wait_for = max(0.0, min_pause_seconds - (now - _LAST_REQUEST_TS))
-        if wait_for > 0:
-            await asyncio.sleep(wait_for)
-        _LAST_REQUEST_TS = monotonic()
-
-
-def _retry_after_seconds(response: httpx.Response | None) -> float | None:
-    if response is None:
-        return None
-    raw = response.headers.get("Retry-After")
-    if not raw:
-        return None
-    try:
-        return max(0.0, float(raw))
-    except Exception:
-        return None
 
 def build_coingecko_auth() -> CoinGeckoAuth:
     auth_mode = settings.coingecko_auth_mode
@@ -281,25 +255,16 @@ def classify_behavioral_universe_filter(closes: list[float]) -> tuple[str, str]:
 
 class CoinGeckoClient:
     def __init__(self) -> None:
-        global _REQUEST_SEMAPHORE
         self.auth = build_coingecko_auth()
-        if _REQUEST_SEMAPHORE is None:
-            _REQUEST_SEMAPHORE = asyncio.Semaphore(max(1, settings.coingecko_max_concurrency))
-        self._request_semaphore = _REQUEST_SEMAPHORE
         self.client = httpx.AsyncClient(
             base_url=self.auth.base_url,
             headers={
                 "accept": "application/json",
-                "user-agent": "crypto-pattern-scanner/1.1",
+                "user-agent": "crypto-pattern-scanner/1.0",
                 self.auth.header_name: self.auth.api_key,
             },
             timeout=settings.request_timeout_seconds,
         )
-
-    async def _paced_get(self, endpoint: str, *, params: dict[str, Any], pause_seconds: float) -> httpx.Response:
-        async with self._request_semaphore:
-            await _wait_for_slot(max(0.0, pause_seconds))
-            return await self.client.get(endpoint, params=params)
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -337,39 +302,22 @@ class CoinGeckoClient:
         items: list[dict[str, Any]] = []
 
         for page in range(1, pages + 1):
-            params = {
-                "vs_currency": vs_currency,
-                "order": "market_cap_desc",
-                "per_page": per_page,
-                "page": page,
-                "sparkline": "false",
-                "price_change_percentage": "24h,7d",
-            }
-            last_error: Exception | None = None
-            for attempt in range(max(1, settings.history_retry_count)):
-                try:
-                    resp = await self._paced_get("/coins/markets", params=params, pause_seconds=settings.market_page_pause_seconds)
-                    resp.raise_for_status()
-                    payload = resp.json()
-                    if not isinstance(payload, list):
-                        raise ValueError("CoinGecko /coins/markets returned non-list payload")
-                    items.extend(payload)
-                    last_error = None
-                    break
-                except httpx.HTTPStatusError as e:
-                    last_error = e
-                    if e.response.status_code == 429 and attempt < max(1, settings.history_retry_count) - 1:
-                        await asyncio.sleep(_retry_after_seconds(e.response) or (settings.history_backoff_base_seconds * (2 ** attempt)))
-                        continue
-                    raise
-                except (httpx.TimeoutException, httpx.RequestError) as e:
-                    last_error = e
-                    if attempt < max(1, settings.history_retry_count) - 1:
-                        await asyncio.sleep(settings.history_backoff_base_seconds * (2 ** attempt))
-                        continue
-                    raise
-            if last_error is not None:
-                raise last_error
+            resp = await self.client.get(
+                "/coins/markets",
+                params={
+                    "vs_currency": vs_currency,
+                    "order": "market_cap_desc",
+                    "per_page": per_page,
+                    "page": page,
+                    "sparkline": "false",
+                    "price_change_percentage": "24h,7d",
+                },
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if not isinstance(payload, list):
+                raise ValueError("CoinGecko /coins/markets returned non-list payload")
+            items.extend(payload)
 
         _cache_set(_MARKETS_CACHE, cache_key, items)
         return [dict(item) for item in items]
@@ -391,7 +339,7 @@ class CoinGeckoClient:
             return cached
 
         try:
-            resp = await self._paced_get(endpoint, params=request_params, pause_seconds=settings.history_request_pause_seconds)
+            resp = await self.client.get(endpoint, params=request_params)
             resp.raise_for_status()
             payload = resp.json()
 
@@ -585,14 +533,13 @@ class CoinGeckoClient:
 
         for attempt in range(retries):
             try:
-                resp = await self._paced_get(
+                resp = await self.client.get(
                     endpoint,
                     params={
                         "vs_currency": vs_currency,
                         "days": str(normalized_days),
                         "interval": interval,
                     },
-                    pause_seconds=settings.history_request_pause_seconds,
                 )
                 resp.raise_for_status()
                 payload = resp.json()
@@ -669,7 +616,7 @@ class CoinGeckoClient:
 
                 if status == 429:
                     if attempt < retries - 1:
-                        await asyncio.sleep(_retry_after_seconds(e.response) or (backoff_base * (2 ** attempt)))
+                        await asyncio.sleep(backoff_base * (2 ** attempt))
                         continue
                     return MarketDataFetchResult(
                         ok=False,

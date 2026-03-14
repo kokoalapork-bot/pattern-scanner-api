@@ -18,6 +18,8 @@ from .data_sources import (
 )
 from .models import (
     BestWindow,
+    CompactScanResponse,
+    CompactScanResult,
     DebugSymbolInfo,
     MatchBreakdown,
     ScanRequest,
@@ -43,8 +45,6 @@ EXEMPLAR_BREAKDOWNS: dict[str, dict[str, float]] = {
         "shelf": 0.77,
         "right_spike": 0.71,
         "reversion": 0.58,
-        "asymmetry": 0.60,
-        "template_shape": 0.69,
     },
     "RIVER": {
         "crown": 0.35,
@@ -727,7 +727,7 @@ async def build_automatic_market_universe(
             continue
 
         all_candidates.append(coin)
-        asset_sources[coin_id.lower()] = {
+       asset_sources[coin_id.lower()] = {
             "source_type": "market_universe",
             "input_symbol": symbol,
             "input_coingecko_id": coin_id,
@@ -753,6 +753,17 @@ async def build_automatic_market_universe(
 
 
 async def scan_pattern(req: ScanRequest) -> ScanResponse:
+def to_compact_scan_result(result: ScanResult) -> CompactScanResult:
+    return CompactScanResult(
+        coingecko_id=result.coingecko_id,
+        symbol=result.symbol,
+        name=result.name,
+        similarity=result.similarity,
+        label=result.label,
+    )
+
+
+async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
     if req.min_age_days > req.max_age_days:
         raise HTTPException(status_code=400, detail="min_age_days must be <= max_age_days")
 
@@ -760,6 +771,9 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
     universe_total_count = 0
     market_batch_size = req.market_batch_size or req.max_coins_to_evaluate
     market_batch_ids: list[str] = []
+    compact_response = req.compact_response
+    include_notes = req.include_notes and not compact_response
+    return_pre_filter_candidates = req.return_pre_filter_candidates and not compact_response
 
     try:
         if req.symbols or req.coingecko_ids:
@@ -784,20 +798,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             raise HTTPException(status_code=503, detail=f"CoinGecko markets error: {e.response.status_code}")
         except httpx.HTTPError as e:
             raise HTTPException(status_code=503, detail=f"CoinGecko connection error: {str(e)}")
-
-        (
-            candidates,
-            pending_coingecko_ids,
-            resolved_symbols,
-            unresolved_symbols,
-            resolved_coingecko_ids,
-            skip_reasons,
-            debug_by_symbol,
-        ) = resolve_requested_assets(
-            markets=markets,
-            symbols=req.symbols,
-            coingecko_ids=req.coingecko_ids,
-        )
 
         invalid_coingecko_ids: list[str] = []
         for cid in pending_coingecko_ids:

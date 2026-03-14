@@ -1,11 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/app/main.py b/app/main.py
-index 0eb9fa5cd76517d0829c867d2e15ffe5e8842253..5ad54312ed21ccce195f44c09971f6a587a2b6b5 100644
---- a/app/main.py
-+++ b/app/main.py
-@@ -1,80 +1,82 @@
-+"""FastAPI entrypoint for the pattern scanner service."""
-+
  from fastapi import FastAPI
  from fastapi.responses import JSONResponse
  from pydantic import BaseModel

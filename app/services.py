@@ -261,28 +261,20 @@ def classify_final_label(
     if structural_score < 28.0:
         return "reject"
 
+    if not left_structure_ok:
+        return "reject"
+
     nearest_distance = min(
         distance_to_siren_breakdown if distance_to_siren_breakdown is not None else 9.0,
         distance_to_river_breakdown if distance_to_river_breakdown is not None else 9.0,
     )
-
-    rescued_partial = (
-        not left_structure_ok
-        and structural_score >= 52.0
-        and exemplar_consistency_score >= 52.0
-        and pre_breakout_base_score >= 68.0
-        and nearest_distance <= 0.20
-    )
-
-    if not left_structure_ok and not rescued_partial:
-        return "reject"
 
     if (
         structural_score >= 60.0
         and exemplar_consistency_score >= 56.0
         and pre_breakout_base_score >= 55.0
         and nearest_distance <= 0.205
-        and (reference_band_passed or pre_breakout_tail_ok or stage_ok or rescued_partial)
+        and (reference_band_passed or pre_breakout_tail_ok or stage_ok)
     ):
         return "strong match"
 
@@ -1353,19 +1345,6 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             evaluated_count=len(evaluated_assets),
         )
 
-        compact_auto = bool(req.compact_response and not (req.symbols or req.coingecko_ids))
-        compact_any = bool(req.compact_response)
-
-        response_debug = debug_by_symbol if req.debug and not compact_auto else {}
-        response_skip_reasons = skip_reasons if not compact_auto else {
-            k: v for k, v in skip_reasons.items() if k in skipped_assets[: max(req.top_k * 5, 25)]
-        }
-        response_prefilter = final_prefilter if req.return_pre_filter_candidates and not compact_auto else []
-
-        if compact_any and not req.include_notes:
-            final_results = [item.model_copy(update={"notes": []}) for item in final_results]
-            response_prefilter = [item.model_copy(update={"notes": []}) for item in response_prefilter]
-
         return ScanResponse(
             pattern_name=req.pattern_name,
             evaluated_count=len(evaluated_assets),
@@ -1384,10 +1363,10 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse:
             market_offset=req.market_offset,
             market_batch_size=market_batch_size or len(candidates),
             market_batch_ids=market_batch_ids,
-            skip_reasons=response_skip_reasons,
-            debug_by_symbol=response_debug,
+            skip_reasons=skip_reasons,
+            debug_by_symbol=debug_by_symbol,
             results=final_results,
-            pre_filter_candidates=response_prefilter,
+            pre_filter_candidates=final_prefilter if req.return_pre_filter_candidates else [],
         )
     finally:
         await client.close()

@@ -50,7 +50,6 @@ class ScanRequest(BaseModel):
     market_offset: int = Field(default=0, ge=0)
     market_batch_size: Optional[int] = Field(default=None, ge=1, le=500)
     return_pre_filter_candidates: bool = True
-    compact_response: bool = True
 
 
 class MatchBreakdown(BaseModel):
@@ -136,7 +135,7 @@ class ScanResult(BaseModel):
     breakdown: MatchBreakdown
     best_window: BestWindow
 
-    notes: list[str] = Field(default_factory=list)
+    notes: list[str] = []
     source: str = "coingecko"
 
 
@@ -146,30 +145,30 @@ class ScanResponse(BaseModel):
     evaluated_count: int
     returned_count: int
 
-    resolved_symbols: list[str] = Field(default_factory=list)
-    unresolved_symbols: list[str] = Field(default_factory=list)
+    resolved_symbols: list[str] = []
+    unresolved_symbols: list[str] = []
 
-    resolved_coingecko_ids: list[str] = Field(default_factory=list)
-    invalid_coingecko_ids: list[str] = Field(default_factory=list)
+    resolved_coingecko_ids: list[str] = []
+    invalid_coingecko_ids: list[str] = []
 
-    evaluated_symbols: list[str] = Field(default_factory=list)
-    skipped_symbols: list[str] = Field(default_factory=list)
+    evaluated_symbols: list[str] = []
+    skipped_symbols: list[str] = []
 
-    evaluated_assets: list[str] = Field(default_factory=list)
-    skipped_assets: list[str] = Field(default_factory=list)
+    evaluated_assets: list[str] = []
+    skipped_assets: list[str] = []
 
     universe_source: str = "coingecko_markets"
     universe_total_count: int = 0
     universe_filtered_count: int = 0
     market_offset: int = 0
     market_batch_size: int = 0
-    market_batch_ids: list[str] = Field(default_factory=list)
+    market_batch_ids: list[str] = []
 
-    skip_reasons: Dict[str, str] = Field(default_factory=dict)
-    debug_by_symbol: Dict[str, DebugSymbolInfo] = Field(default_factory=dict)
+    skip_reasons: Dict[str, str] = {}
+    debug_by_symbol: Dict[str, DebugSymbolInfo] = {}
 
     results: list[ScanResult]
-    pre_filter_candidates: list[ScanResult] = Field(default_factory=list)
+    pre_filter_candidates: list[ScanResult] = []
 
 
 class ErrorResponse(BaseModel):

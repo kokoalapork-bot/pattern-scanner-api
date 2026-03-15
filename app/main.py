@@ -4,8 +4,6 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from .config import settings
-from .data_sources import build_coingecko_auth
 from .models import CompactScanResponse, ErrorResponse, ScanRequest, ScanResponse
 from .services import scan_pattern
 
@@ -38,9 +36,16 @@ app = FastAPI(
 )
 
 
-@app.on_event("startup")
-async def validate_integrations() -> None:
-    build_coingecko_auth()
+@app.get("/", response_model=RootResponse)
+async def root() -> RootResponse:
+    return RootResponse(
+        message="Crypto Pattern Scanner API is running.",
+        docs="/docs",
+        health="/health",
+        openapi="/openapi.json",
+        default_min_age_days=14,
+        default_max_age_days=90,
+    )
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -55,32 +60,13 @@ async def health() -> HealthResponse:
 @app.post(
     "/scan",
     response_model=ScanResponse | CompactScanResponse,
-    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
-    summary="Scan assets by symbols and/or coingecko_ids",
+    responses={400: {"model": ErrorResponse}},
 )
 async def scan(req: ScanRequest):
-    if req.top_k > req.max_coins_to_evaluate:
+    try:
+        return await scan_pattern(req)
+    except ValueError as exc:
         return JSONResponse(
             status_code=400,
-            content={"detail": "top_k cannot be greater than max_coins_to_evaluate"},
+            content=ErrorResponse(error=str(exc)).model_dump(),
         )
-
-    if not req.symbols and not req.coingecko_ids and req.max_coins_to_evaluate < 1:
-        return JSONResponse(
-            status_code=400,
-            content={"detail": "Provide symbols, coingecko_ids, or a positive max_coins_to_evaluate"},
-        )
-
-    return await scan_pattern(req)
-
-
-@app.get("/", response_model=RootResponse)
-async def root() -> RootResponse:
-    return RootResponse(
-        message="Crypto Pattern Scanner API",
-        docs="/docs",
-        health="/health",
-        openapi="/openapi.json",
-        default_min_age_days=settings.default_min_age_days,
-        default_max_age_days=settings.default_max_age_days,
-    )

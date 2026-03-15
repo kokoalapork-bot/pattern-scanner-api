@@ -44,7 +44,7 @@ async def root() -> RootResponse:
         health="/health",
         openapi="/openapi.json",
         default_min_age_days=14,
-        default_max_age_days=90,
+        default_max_age_days=394,
     )
 
 
@@ -68,5 +68,5 @@ async def scan(req: ScanRequest):
     except ValueError as exc:
         return JSONResponse(
             status_code=400,
-            content=ErrorResponse(error=str(exc)).model_dump(),
+            content=ErrorResponse(detail=str(exc)).model_dump(),
         )

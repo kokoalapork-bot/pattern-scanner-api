@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     )
 
     default_min_age_days: int = 14
-    default_max_age_days: int = 450
+    default_max_age_days: int = 90
 
     min_market_cap_usd: float = 0.0
     min_24h_volume_usd: float = 0.0

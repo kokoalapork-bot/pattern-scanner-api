@@ -464,8 +464,33 @@ def compute_pre_breakout_window_features(window_closes: list[float]) -> dict[str
     }
 
 
+
+def _target_band_score(value: float, low: float, high: float, soft: float = 0.15) -> float:
+    if high <= low:
+        return 0.0
+    span = high - low
+    if low <= value <= high:
+        center = (low + high) / 2.0
+        half = max(1e-9, span / 2.0)
+        return max(0.0, 1.0 - abs(value - center) / half * 0.18)
+    if value < low:
+        floor = low - span * (1.0 + soft)
+        if value <= floor:
+            return 0.0
+        return max(0.0, (value - floor) / max(1e-9, low - floor))
+    ceil = high + span * (1.0 + soft)
+    if value >= ceil:
+        return 0.0
+    return max(0.0, (ceil - value) / max(1e-9, ceil - high))
+
+
 def compute_listing_ath_road_features(window_closes: list[float]) -> dict[str, float]:
-    if len(window_closes) < 18:
+    """
+    Target sequence:
+    listing -> initial drop -> bottom -> 500-900% recovery to ATH/crown
+    -> 50-90% dump -> live sideways road/base
+    """
+    if len(window_closes) < 20:
         return {
             "listing_to_ath_score": 0.0,
             "crown_after_ath_score": 0.0,
@@ -476,35 +501,40 @@ def compute_listing_ath_road_features(window_closes: list[float]) -> dict[str, f
             "road_fit_score": 0.0,
         }
 
-    n = len(window_closes)
-    listing_zone = window_closes[: max(4, int(n * 0.12))]
-    search_end = max(8, min(n - 4, int(n * 0.45)))
-    ath_idx = max(range(search_end), key=lambda i: window_closes[i])
-    ath = window_closes[ath_idx]
-    listing_floor = min(listing_zone)
-    listing_mid = _safe_mean(listing_zone)
-    total_low = min(window_closes)
-    denom = max(1e-9, ath - min(total_low, listing_floor))
+    closes = [float(x) for x in window_closes if x is not None]
+    n = len(closes)
+    listing_anchor = max(1e-9, _safe_mean(closes[: max(3, int(n * 0.08))]))
+    early_end = max(6, min(n - 10, int(n * 0.32)))
+    bottom_idx = min(range(1, early_end), key=lambda i: closes[i])
+    bottom = max(1e-9, closes[bottom_idx])
 
-    # 1) Быстрый ранний импульс после листинга.
-    listing_to_ath_ratio = max(0.0, ath - listing_mid) / max(1e-9, listing_mid)
-    listing_to_ath_score = max(0.0, min(1.0, listing_to_ath_ratio / 1.15))
+    initial_drop_pct = max(0.0, (listing_anchor - bottom) / listing_anchor)
+    initial_drop_score = _target_band_score(initial_drop_pct, 0.22, 0.75, soft=0.35)
 
-    # 2) Корона / распределение у верхов после ATH.
-    crown_slice = window_closes[max(0, ath_idx - 2): min(n, ath_idx + max(5, int(n * 0.12)))]
-    near_ath = sum(1 for x in crown_slice if x >= ath * 0.84) / max(1, len(crown_slice))
-    crown_std = _safe_std(crown_slice) / max(1e-9, ath)
-    crown_after_ath_score = max(
-        0.0,
-        min(1.0, 0.60 * near_ath + 0.40 * min(1.0, crown_std / 0.10)),
-    )
+    ath_start = min(n - 8, bottom_idx + 2)
+    ath_end = max(ath_start + 3, min(n - 5, int(n * 0.72)))
+    ath_idx = max(range(ath_start, ath_end), key=lambda i: closes[i])
+    ath = max(1e-9, closes[ath_idx])
 
-    # 3) Слив после ATH, но не в ноль.
-    post = window_closes[ath_idx + 1:]
+    order_ok = 1.0 if (bottom_idx >= 1 and ath_idx > bottom_idx + 1) else 0.0
+
+    recovery_gain = max(0.0, (ath - bottom) / bottom)
+    listing_to_ath_score = _target_band_score(recovery_gain, 5.0, 9.0, soft=0.45)
+
+    crown_slice = closes[max(bottom_idx + 1, ath_idx - 3): min(n, ath_idx + max(5, int(n * 0.10)))]
+    near_ath_band = sum(1 for x in crown_slice if x >= ath * 0.90) / max(1, len(crown_slice))
+    local_peaks = 0
+    for i in range(1, len(crown_slice) - 1):
+        if crown_slice[i] >= crown_slice[i - 1] and crown_slice[i] >= crown_slice[i + 1] and crown_slice[i] >= ath * 0.92:
+            local_peaks += 1
+    crown_multi_peak = min(1.0, local_peaks / 2.0)
+    crown_after_ath_score = max(0.0, min(1.0, 0.60 * near_ath_band + 0.40 * crown_multi_peak))
+
+    post = closes[ath_idx + 1 :]
     if len(post) < 6:
         return {
-            "listing_to_ath_score": round(listing_to_ath_score, 4),
-            "crown_after_ath_score": round(crown_after_ath_score, 4),
+            "listing_to_ath_score": round(listing_to_ath_score * order_ok, 4),
+            "crown_after_ath_score": round(crown_after_ath_score * order_ok, 4),
             "drawdown_to_base_score": 0.0,
             "not_dead_after_dump_score": 0.0,
             "base_survival_score": 0.0,
@@ -512,44 +542,67 @@ def compute_listing_ath_road_features(window_closes: list[float]) -> dict[str, f
             "road_fit_score": 0.0,
         }
 
-    base_search = post[: max(6, int(len(post) * 0.70))]
-    post_min = min(base_search)
-    post_min_idx = ath_idx + 1 + base_search.index(post_min)
-    dump_ratio = max(0.0, ath - post_min) / max(1e-9, ath - listing_floor)
+    dump_low_rel_idx = min(range(len(post)), key=lambda i: post[i])
+    dump_low_idx = ath_idx + 1 + dump_low_rel_idx
+    dump_low = max(1e-9, closes[dump_low_idx])
+    dump_pct = max(0.0, 1.0 - dump_low / ath)
+    drawdown_to_base_score = _target_band_score(dump_pct, 0.50, 0.90, soft=0.25)
 
-    # Цель примерно как у River/Siren: глубокий, но живой откат.
-    drawdown_to_base_score = max(0.0, min(1.0, 1.0 - abs(dump_ratio - 0.82) / 0.22))
+    range_floor = min(bottom, min(closes))
+    total_range = max(1e-9, ath - range_floor)
+    retained_band = max(0.0, (dump_low - range_floor) / total_range)
+    not_dead_after_dump_score = _target_band_score(retained_band, 0.08, 0.42, soft=0.35)
 
-    retained_from_ath = post_min / max(1e-9, ath)
-    not_dead_after_dump_score = max(0.0, min(1.0, (retained_from_ath - 0.10) / 0.18))
-    dump_to_zero_penalty = max(0.0, min(1.0, (0.12 - retained_from_ath) / 0.08))
-
-    # 4) Дальше должна быть живая дорожка/полка, а не мёртвая линия.
-    road = window_closes[post_min_idx: max(post_min_idx + 4, int(n * 0.90))]
-    road_band_high = post_min + 0.38 * (ath - post_min)
-    in_road_band = sum(1 for x in road if post_min <= x <= road_band_high) / max(1, len(road))
-    road_std = _safe_std(road) / max(1e-9, ath - post_min)
-    alive_vol = max(0.0, min(1.0, road_std / 0.22))
-    base_survival_score = max(0.0, min(1.0, 0.72 * in_road_band + 0.28 * alive_vol))
-
-    road_fit_score = 100.0 * (
-        0.16 * listing_to_ath_score
-        + 0.16 * crown_after_ath_score
-        + 0.26 * drawdown_to_base_score
-        + 0.18 * not_dead_after_dump_score
-        + 0.24 * base_survival_score
+    # penalize "straight to zero" / dead collapse after the crown
+    below_bottom = max(0.0, (bottom - dump_low) / bottom)
+    dump_to_zero_penalty = max(
+        0.0,
+        min(
+            1.0,
+            0.55 * max(0.0, (0.08 - retained_band) / 0.08)
+            + 0.45 * max(0.0, (below_bottom - 0.20) / 0.80),
+        ),
     )
-    road_fit_score = max(0.0, min(100.0, road_fit_score - 28.0 * dump_to_zero_penalty))
+
+    road = closes[dump_low_idx:]
+    if len(road) < 5:
+        base_survival_score = 0.0
+    else:
+        road_mean = max(1e-9, _safe_mean(road))
+        road_std = _safe_std(road) / road_mean
+        road_hi = max(road)
+        road_lo = min(road)
+        road_band = max(1e-9, road_hi - road_lo)
+        in_band = sum(
+            1 for x in road
+            if (dump_low <= x <= dump_low + 0.45 * max(1e-9, ath - dump_low))
+        ) / max(1, len(road))
+        alive = min(1.0, road_std / 0.18)
+        sideways = max(0.0, min(1.0, 1.0 - max(0.0, road_band / max(1e-9, ath) - 0.28) / 0.40))
+        base_survival_score = max(0.0, min(1.0, 0.45 * in_band + 0.25 * alive + 0.30 * sideways))
+
+    phase_integrity = (
+        0.18 * initial_drop_score
+        + 0.24 * listing_to_ath_score
+        + 0.18 * crown_after_ath_score
+        + 0.20 * drawdown_to_base_score
+        + 0.10 * not_dead_after_dump_score
+        + 0.10 * base_survival_score
+    ) * order_ok
+
+    road_fit_score = 100.0 * phase_integrity - 32.0 * dump_to_zero_penalty
+    road_fit_score = max(0.0, min(100.0, road_fit_score))
 
     return {
-        "listing_to_ath_score": round(listing_to_ath_score, 4),
-        "crown_after_ath_score": round(crown_after_ath_score, 4),
-        "drawdown_to_base_score": round(drawdown_to_base_score, 4),
-        "not_dead_after_dump_score": round(not_dead_after_dump_score, 4),
-        "base_survival_score": round(base_survival_score, 4),
+        "listing_to_ath_score": round(listing_to_ath_score * order_ok, 4),
+        "crown_after_ath_score": round(crown_after_ath_score * order_ok, 4),
+        "drawdown_to_base_score": round(drawdown_to_base_score * order_ok, 4),
+        "not_dead_after_dump_score": round(not_dead_after_dump_score * order_ok, 4),
+        "base_survival_score": round(base_survival_score * order_ok, 4),
         "dump_to_zero_penalty": round(dump_to_zero_penalty, 4),
         "road_fit_score": round(road_fit_score, 2),
     }
+
 
 def find_best_window(closes: list[float], min_age_days: int, max_age_days: int, stage_mode: str = "legacy"):
     best_effective = -1.0
@@ -587,19 +640,25 @@ def find_best_window(closes: list[float], min_age_days: int, max_age_days: int, 
 
         structural_for_blend = effective_structural
         if stage_mode == "pre_breakout_only":
-            structural_for_blend = 0.43 * effective_structural + 0.32 * float(pre_breakout_window["prebreakout_structural"]) + 0.25 * float(listing_path["road_fit_score"])
+            structural_for_blend = (
+                0.28 * effective_structural
+                + 0.22 * float(pre_breakout_window["prebreakout_structural"])
+                + 0.50 * float(listing_path["road_fit_score"])
+            )
         else:
-            structural_for_blend = 0.78 * effective_structural + 0.22 * float(listing_path["road_fit_score"])
+            structural_for_blend = 0.55 * effective_structural + 0.45 * float(listing_path["road_fit_score"])
 
         final_score = combine_scores(
             structural_score=structural_for_blend,
             exemplar_consistency_score=float(exemplar_metrics["exemplar_consistency_score"]),
         )
-        final_score = round(
-            final_score
-            * (0.78 + 0.14 * (float(pre_breakout["pre_breakout_base_score"]) / 100.0) + 0.08 * (float(listing_path["base_survival_score"]))),
-            2,
+        phase_boost = (
+            0.72
+            + 0.10 * (float(pre_breakout["pre_breakout_base_score"]) / 100.0)
+            + 0.10 * float(listing_path["base_survival_score"])
+            + 0.08 * float(listing_path["drawdown_to_base_score"])
         )
+        final_score = round(final_score * phase_boost, 2)
         final_score = round(
             max(
                 0.0,

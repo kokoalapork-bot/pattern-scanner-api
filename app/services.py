@@ -263,13 +263,22 @@ def classify_final_label(
     if structural_score < 28.0:
         return "reject"
 
-    if not left_structure_ok:
-        return "reject"
-
     nearest_distance = min(
         distance_to_siren_breakdown if distance_to_siren_breakdown is not None else 9.0,
         distance_to_river_breakdown if distance_to_river_breakdown is not None else 9.0,
     )
+
+    # Do not hard-reject candidates only because the left crown is soft.
+    # River/Siren-style setups can still be relevant if the overall phase path,
+    # post-crown dump, and base behavior are otherwise close to the exemplars.
+    if not left_structure_ok:
+        if (
+            structural_score < 45.0
+            or exemplar_consistency_score < 42.0
+            or pre_breakout_base_score < 42.0
+            or nearest_distance > 0.29
+        ):
+            return "reject"
 
     if (
         structural_score >= 60.0
@@ -277,6 +286,7 @@ def classify_final_label(
         and pre_breakout_base_score >= 55.0
         and nearest_distance <= 0.205
         and (reference_band_passed or pre_breakout_tail_ok or stage_ok)
+        and left_structure_ok
     ):
         return "strong match"
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -26,6 +27,8 @@ class Settings(BaseSettings):
     exclude_stables: bool = True
     exclude_tokenized_stocks: bool = True
     max_market_cap_usd_for_pattern: float = 1_000_000_000.0
+
+    min_listing_date_after: str = "2025-10-10"
 
     # How deep to fetch the CoinGecko market universe for automatic scans.
     # This is intentionally independent from max_coins_to_evaluate, so smaller /scan

@@ -25,7 +25,7 @@ class Settings(BaseSettings):
 
     exclude_stables: bool = True
     exclude_tokenized_stocks: bool = True
-    max_market_cap_usd_for_pattern: float = 15_000_000_000.0
+    max_market_cap_usd_for_pattern: float = 1_000_000_000.0
 
     # How deep to fetch the CoinGecko market universe for automatic scans.
     # This is intentionally independent from max_coins_to_evaluate, so smaller /scan

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -19,16 +18,15 @@ class Settings(BaseSettings):
     )
 
     default_min_age_days: int = 14
-    default_max_age_days: int = 90
+    default_max_age_days: int = 394
 
     min_market_cap_usd: float = 0.0
     min_24h_volume_usd: float = 0.0
-
     exclude_stables: bool = True
     exclude_tokenized_stocks: bool = True
-    max_market_cap_usd_for_pattern: float = 1_000_000_000.0
 
-    min_listing_date_after: str = "2025-10-10"
+    max_market_cap_usd_for_pattern: float = 1_000_000_000.0
+    min_listing_date_after: str = "2025-02-14"
 
     # How deep to fetch the CoinGecko market universe for automatic scans.
     # This is intentionally independent from max_coins_to_evaluate, so smaller /scan
@@ -48,6 +46,7 @@ class Settings(BaseSettings):
     stable_price_peg_tolerance: float = 0.15
     stable_max_cv: float = 0.03
     stable_max_range_ratio: float = 0.12
+
     low_volatility_max_cv: float = 0.02
     low_volatility_max_range_ratio: float = 0.08
 
@@ -86,10 +85,8 @@ class Settings(BaseSettings):
             raise ValueError("COINGECKO_BASE_URL must be a valid absolute URL")
 
         netloc = parsed.netloc.lower()
-
         if self.coingecko_auth_mode == "demo" and "pro-api.coingecko.com" in netloc:
             raise ValueError("demo mode cannot use pro-api.coingecko.com")
-
         if self.coingecko_auth_mode == "pro" and "pro-api.coingecko.com" not in netloc:
             raise ValueError("pro mode must use pro-api.coingecko.com")
 
@@ -102,7 +99,6 @@ class Settings(BaseSettings):
 
         if self.market_universe_pages < 1:
             raise ValueError("market_universe_pages must be >= 1")
-
         if self.market_universe_per_page < 1 or self.market_universe_per_page > 250:
             raise ValueError("market_universe_per_page must be between 1 and 250")
 

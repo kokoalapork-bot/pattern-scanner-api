@@ -243,6 +243,7 @@ def compute_pre_breakout_guardrails(
     }
 
 
+
 def classify_final_label(
     *,
     base_label: str,
@@ -256,11 +257,14 @@ def classify_final_label(
     pre_breakout_base_score: float = 50.0,
     distance_to_siren_breakdown: float | None = None,
     distance_to_river_breakdown: float | None = None,
+    listing_to_ath_score: float = 0.0,
+    crown_after_ath_score: float = 0.0,
+    drawdown_to_base_score: float = 0.0,
+    not_dead_after_dump_score: float = 0.0,
+    base_survival_score: float = 0.0,
+    road_fit_score: float = 0.0,
 ) -> str:
     if universe_filter_status != "included_for_scoring":
-        return "reject"
-
-    if structural_score < 34.0:
         return "reject"
 
     nearest_distance = min(
@@ -268,48 +272,69 @@ def classify_final_label(
         distance_to_river_breakdown if distance_to_river_breakdown is not None else 9.0,
     )
 
-    # Do not hard-reject candidates only because the left crown is soft.
-    # River/Siren-style setups can still be relevant if the overall phase path,
-    # post-crown dump, and base behavior are otherwise close to the exemplars.
-    if not left_structure_ok:
-        if (
-            structural_score < 45.0
-            or exemplar_consistency_score < 42.0
-            or pre_breakout_base_score < 42.0
-            or nearest_distance > 0.29
-        ):
-            return "reject"
+    # Mandatory phase gates from the annotated River/Siren reference:
+    # 1) early listing weakness / bottom must exist
+    # 2) that bottom must be followed by a real upper crown/distribution zone
+    if listing_to_ath_score < 0.58:
+        return "reject"
+    if crown_after_ath_score < 0.62:
+        return "reject"
+
+    # Later phases are also required, but can be a bit softer.
+    if drawdown_to_base_score < 0.48:
+        return "reject"
+    if base_survival_score < 0.44:
+        return "reject"
+    if not_dead_after_dump_score < 0.38:
+        return "reject"
+
+    if structural_score < 36.0:
+        return "reject"
+    if exemplar_consistency_score < 36.0:
+        return "reject"
+    if pre_breakout_base_score < 30.0:
+        return "reject"
+    if road_fit_score < 58.0:
+        return "reject"
+    if nearest_distance > 0.32:
+        return "reject"
+
+    # The left structure can be soft, but only if the full ordered phase path is strong.
+    if not left_structure_ok and road_fit_score < 70.0:
+        return "reject"
 
     if (
-        structural_score >= 60.0
-        and exemplar_consistency_score >= 56.0
-        and pre_breakout_base_score >= 55.0
-        and nearest_distance <= 0.205
+        structural_score >= 58.0
+        and exemplar_consistency_score >= 50.0
+        and pre_breakout_base_score >= 46.0
+        and nearest_distance <= 0.24
+        and road_fit_score >= 72.0
+        and drawdown_to_base_score >= 0.58
+        and crown_after_ath_score >= 0.72
+        and base_survival_score >= 0.52
         and (reference_band_passed or pre_breakout_tail_ok or stage_ok)
-        and left_structure_ok
     ):
         return "strong match"
 
     if (
-        structural_score >= 45.0
-        and exemplar_consistency_score >= 42.0
-        and pre_breakout_base_score >= 42.0
-        and nearest_distance <= 0.285
+        structural_score >= 44.0
+        and exemplar_consistency_score >= 40.0
+        and pre_breakout_base_score >= 34.0
+        and nearest_distance <= 0.29
+        and road_fit_score >= 62.0
     ):
         if base_label == "weak-crown variant":
             return "weak-crown variant"
         return "partial match"
 
     if (
-        structural_score >= 36.0
-        and exemplar_consistency_score >= 38.0
-        and pre_breakout_base_score >= 34.0
-        and nearest_distance <= 0.33
+        structural_score >= 38.0
+        and exemplar_consistency_score >= 36.0
+        and pre_breakout_base_score >= 30.0
+        and nearest_distance <= 0.32
+        and road_fit_score >= 58.0
     ):
         return "watchlist candidate"
-
-    if structural_score >= 55.0:
-        return "weak match"
 
     return "reject"
 
@@ -521,18 +546,18 @@ def _count_local_peaks(xs: list[float], threshold: float = 0.0) -> int:
     return peaks
 
 
+
 def compute_listing_ath_road_features(window_closes: list[float]) -> dict[str, float]:
     """
-    Shape-only target sequence derived from the marked RIVER / SIREN zones:
+    Strict River/Siren phase model from the annotated reference:
 
-    1) listing prints and weakens first
-    2) an early bottom forms
-    3) price recovers strongly into an upper crown / distribution zone
-    4) crown dumps hard but does not die into zero
-    5) price holds a long sideways road / live base with optional right spike
+    1) listing shock / early selloff to a visible bottom
+    2) strong recovery from that bottom into a broad upper crown zone
+       (1 and 2 are mandatory)
+    3) sharp markdown from the crown
+    4) long living sideways road / base after the dump, optionally with a right spike
 
-    All measurements below are normalized to the candle path itself via min-max
-    scaling, so the scorer uses movement shape rather than absolute price numbers.
+    The scorer uses normalized candle-path shape only. Absolute price numbers do not matter.
     """
     if len(window_closes) < 24:
         return {
@@ -549,48 +574,78 @@ def compute_listing_ath_road_features(window_closes: list[float]) -> dict[str, f
     n = len(closes)
     scaled = _series_minmax_scale(closes)
 
-    first_q_end = max(5, int(n * 0.22))
-    second_q_end = max(first_q_end + 5, int(n * 0.50))
-    pre_end = max(second_q_end + 4, int(n * 0.82))
+    early_end = max(5, int(n * 0.16))
+    early_bottom_search_end = max(6, int(n * 0.24))
+    crown_search_start = max(early_bottom_search_end + 2, int(n * 0.22))
+    crown_search_end = max(crown_search_start + 6, int(n * 0.62))
 
-    listing_anchor = _safe_mean(scaled[: max(3, int(n * 0.06))])
-    bottom_idx = min(range(1, first_q_end), key=lambda i: scaled[i])
+    listing_anchor = _safe_mean(scaled[:max(2, int(n * 0.04))])
+
+    # Phase 1: very early listing weakness into a true bottom.
+    bottom_idx = min(range(1, early_bottom_search_end), key=lambda i: scaled[i])
     bottom = scaled[bottom_idx]
-
-    # ATH/crown must happen after the early bottom and before the final breakout area.
-    ath_start = min(n - 10, bottom_idx + 2)
-    ath_end = max(ath_start + 4, min(pre_end, int(n * 0.62)))
-    ath_idx = max(range(ath_start, ath_end), key=lambda i: scaled[i])
-    ath = scaled[ath_idx]
-
-    order_ok = 1.0 if (bottom_idx >= 1 and ath_idx > bottom_idx + 2) else 0.0
-
-    # Phase 1: listing weakness -> early bottom.
     initial_drop_depth = max(0.0, listing_anchor - bottom)
-    initial_drop_score = _target_band_score(initial_drop_depth, 0.10, 0.45, soft=0.40)
+    initial_drop_score = _target_band_score(initial_drop_depth, 0.12, 0.48, soft=0.30)
 
-    # Phase 2: rebound from bottom into upper zone / crown.
+    # Bottom must happen early and the path into it should actually slope down.
+    left_slice = scaled[: bottom_idx + 1]
+    left_slope_score = _target_band_score(max(0.0, -_segment_slope(left_slice) * len(left_slice)), 0.06, 0.60, soft=0.35)
+    bottom_timing_score = _target_band_score(bottom_idx / max(1, n), 0.04, 0.20, soft=0.25)
+
+    # Phase 2: recovery into crown must happen AFTER the early bottom, not at listing.
+    ath_idx = max(range(crown_search_start, crown_search_end), key=lambda i: scaled[i])
+    ath = scaled[ath_idx]
     recovery_height = max(0.0, ath - bottom)
-    listing_to_ath_score = _target_band_score(recovery_height, 0.55, 0.98, soft=0.30)
+    recovery_ratio_score = _target_band_score(recovery_height, 0.45, 0.92, soft=0.24)
 
-    # Phase 3: crown/distribution around ATH (wide top, several touches, not one needle).
-    crown_left = max(bottom_idx + 1, ath_idx - max(3, int(n * 0.06)))
-    crown_right = min(n, ath_idx + max(5, int(n * 0.11)))
-    crown_slice = scaled[crown_left:crown_right] or scaled[max(0, ath_idx - 2): min(n, ath_idx + 3)]
-    high_band_ratio = sum(1 for x in crown_slice if x >= (ath - 0.10)) / max(1, len(crown_slice))
-    crown_peaks = _count_local_peaks(crown_slice, threshold=max(0.72, ath - 0.12))
-    crown_peak_score = min(1.0, crown_peaks / 2.5)
-    crown_width_score = _target_band_score(len(crown_slice) / max(1, n), 0.08, 0.22, soft=0.40)
+    recovery_slice = scaled[bottom_idx: ath_idx + 1]
+    recovery_slope_score = _target_band_score(max(0.0, _segment_slope(recovery_slice) * len(recovery_slice)), 0.08, 0.70, soft=0.35)
+
+    # ATH cannot be the listing spike. It must be materially after the bottom.
+    ath_timing_score = _target_band_score(ath_idx / max(1, n), 0.20, 0.58, soft=0.25)
+    ordering_ok = 1.0 if ath_idx >= bottom_idx + max(3, int(n * 0.06)) else 0.0
+
+    listing_to_ath_score = max(
+        0.0,
+        min(
+            1.0,
+            0.28 * initial_drop_score
+            + 0.18 * left_slope_score
+            + 0.16 * bottom_timing_score
+            + 0.20 * recovery_ratio_score
+            + 0.10 * recovery_slope_score
+            + 0.08 * ath_timing_score,
+        ),
+    ) * ordering_ok
+
+    # Phase 2b: upper crown / distribution cluster, not a single spike.
+    crown_left = max(bottom_idx + 2, ath_idx - max(4, int(n * 0.10)))
+    crown_right = min(n, ath_idx + max(5, int(n * 0.12)))
+    crown_slice = scaled[crown_left:crown_right] or scaled[max(0, ath_idx - 3): min(n, ath_idx + 4)]
+
+    upper_band = max(0.70, ath - 0.12)
+    high_band_ratio = sum(1 for x in crown_slice if x >= upper_band) / max(1, len(crown_slice))
+    crown_peaks = _count_local_peaks(crown_slice, threshold=upper_band)
+    crown_peak_score = min(1.0, crown_peaks / 2.0)
+    crown_width_score = _target_band_score(len(crown_slice) / max(1, n), 0.10, 0.26, soft=0.28)
+    crown_flatness = 1.0 - min(1.0, abs(_segment_slope(crown_slice)) / 0.030)
+    crown_flatness = max(0.0, crown_flatness)
     crown_after_ath_score = max(
         0.0,
-        min(1.0, 0.45 * high_band_ratio + 0.35 * crown_peak_score + 0.20 * crown_width_score),
-    )
+        min(
+            1.0,
+            0.35 * high_band_ratio
+            + 0.25 * crown_peak_score
+            + 0.20 * crown_width_score
+            + 0.20 * crown_flatness,
+        ),
+    ) * ordering_ok
 
     post = scaled[ath_idx + 1 :]
     if len(post) < 8:
         return {
-            "listing_to_ath_score": round(listing_to_ath_score * order_ok, 4),
-            "crown_after_ath_score": round(crown_after_ath_score * order_ok, 4),
+            "listing_to_ath_score": round(listing_to_ath_score, 4),
+            "crown_after_ath_score": round(crown_after_ath_score, 4),
             "drawdown_to_base_score": 0.0,
             "not_dead_after_dump_score": 0.0,
             "base_survival_score": 0.0,
@@ -598,68 +653,105 @@ def compute_listing_ath_road_features(window_closes: list[float]) -> dict[str, f
             "road_fit_score": 0.0,
         }
 
+    # Phase 3: markdown out of the crown into a lower live base.
     dump_low_rel_idx = min(range(len(post)), key=lambda i: post[i])
     dump_low_idx = ath_idx + 1 + dump_low_rel_idx
     dump_low = scaled[dump_low_idx]
-
-    # Phase 4: hard dump from crown.
     dump_depth = max(0.0, ath - dump_low)
-    drawdown_to_base_score = _target_band_score(dump_depth, 0.35, 0.82, soft=0.30)
+    drawdown_to_base_score = _target_band_score(dump_depth, 0.28, 0.74, soft=0.26) * ordering_ok
 
-    # Phase 5: do not die into zero. Base should stay alive above the absolute floor.
+    dump_slice = scaled[ath_idx: dump_low_idx + 1]
+    dump_speed = max(0.0, -_segment_slope(dump_slice) * len(dump_slice))
+    dump_speed_score = _target_band_score(dump_speed, 0.10, 0.95, soft=0.35)
+
     retained_level = dump_low
-    not_dead_after_dump_score = _target_band_score(retained_level, 0.08, 0.42, soft=0.35)
-    dump_to_zero_penalty = 1.0 if retained_level <= 0.04 else max(0.0, (0.10 - retained_level) / 0.06)
+    not_dead_after_dump_score = _target_band_score(retained_level, 0.08, 0.38, soft=0.24)
+    dump_to_zero_penalty = 1.0 if retained_level <= 0.035 else max(0.0, (0.09 - retained_level) / 0.055)
 
     base_slice = scaled[dump_low_idx:]
     if len(base_slice) < 6:
         return {
-            "listing_to_ath_score": round(listing_to_ath_score * order_ok, 4),
-            "crown_after_ath_score": round(crown_after_ath_score * order_ok, 4),
-            "drawdown_to_base_score": round(drawdown_to_base_score * order_ok, 4),
-            "not_dead_after_dump_score": round(not_dead_after_dump_score * order_ok, 4),
+            "listing_to_ath_score": round(listing_to_ath_score, 4),
+            "crown_after_ath_score": round(crown_after_ath_score, 4),
+            "drawdown_to_base_score": round(drawdown_to_base_score, 4),
+            "not_dead_after_dump_score": round(not_dead_after_dump_score, 4),
             "base_survival_score": 0.0,
             "dump_to_zero_penalty": round(dump_to_zero_penalty, 4),
             "road_fit_score": 0.0,
         }
 
+    # Phase 4: long living sideways road / base after the dump.
     base_mean = _safe_mean(base_slice)
     base_amp = max(base_slice) - min(base_slice)
     base_slope = abs(_segment_slope(base_slice))
-    in_road_ratio = sum(1 for x in base_slice if 0.08 <= x <= 0.48) / max(1, len(base_slice))
-    liveliness = _target_band_score(base_amp, 0.06, 0.34, soft=0.40)
-    flatness = _target_band_score(base_slope, 0.0, 0.010, soft=0.40)
-    base_level_score = _target_band_score(base_mean, 0.10, 0.36, soft=0.40)
+    base_duration_ratio = len(base_slice) / max(1, n)
+    in_road_ratio = sum(1 for x in base_slice if 0.10 <= x <= 0.52) / max(1, len(base_slice))
+    liveliness = _target_band_score(base_amp, 0.05, 0.30, soft=0.30)
+    flatness = _target_band_score(base_slope, 0.0, 0.010, soft=0.35)
+    base_level_score = _target_band_score(base_mean, 0.12, 0.34, soft=0.30)
+    base_duration_score = _target_band_score(base_duration_ratio, 0.22, 0.52, soft=0.24)
+
+    # Reject HNT-like monotonic death spirals: most of the path after the dump cannot keep making lower lows.
+    lower_low_count = 0
+    running_low = base_slice[0]
+    for x in base_slice[1:]:
+        if x < running_low - 0.01:
+            lower_low_count += 1
+            running_low = x
+    lower_low_ratio = lower_low_count / max(1, len(base_slice) - 1)
+    anti_death_score = _target_band_score(lower_low_ratio, 0.0, 0.18, soft=0.20)
+
     base_survival_score = max(
         0.0,
-        min(1.0, 0.35 * in_road_ratio + 0.25 * liveliness + 0.20 * flatness + 0.20 * base_level_score),
-    )
+        min(
+            1.0,
+            0.22 * in_road_ratio
+            + 0.18 * liveliness
+            + 0.16 * flatness
+            + 0.16 * base_level_score
+            + 0.16 * base_duration_score
+            + 0.12 * anti_death_score,
+        ),
+    ) * ordering_ok
 
-    # Optional right spike from the road without invalidating the base.
-    right_tail = base_slice[max(0, int(len(base_slice) * 0.60)) :]
+    # Optional right spike emerging from the road.
+    right_tail = base_slice[max(0, int(len(base_slice) * 0.55)) :]
     right_tail_spike = (max(right_tail) - _safe_mean(right_tail)) if right_tail else 0.0
-    right_spike_bonus = _target_band_score(right_tail_spike, 0.06, 0.30, soft=0.60)
+    right_spike_bonus = _target_band_score(right_tail_spike, 0.05, 0.24, soft=0.45)
 
-    # Final shape score: mostly path order + crown + dump + sideways road.
+    # Hard fail masks for the two mandatory phases.
+    mandatory_phase_mask = 1.0
+    if initial_drop_score < 0.35:
+        mandatory_phase_mask = 0.0
+    if recovery_ratio_score < 0.40:
+        mandatory_phase_mask = 0.0
+    if crown_after_ath_score < 0.40:
+        mandatory_phase_mask = 0.0
+    if ath_idx <= bottom_idx + 2:
+        mandatory_phase_mask = 0.0
+    if ath_idx <= early_end:
+        mandatory_phase_mask = 0.0
+
     road_fit_score = (
-        0.10 * initial_drop_score
-        + 0.18 * listing_to_ath_score
-        + 0.22 * crown_after_ath_score
-        + 0.18 * drawdown_to_base_score
-        + 0.12 * not_dead_after_dump_score
-        + 0.16 * base_survival_score
-        + 0.04 * right_spike_bonus
-    ) * order_ok * 100.0
+        0.22 * listing_to_ath_score
+        + 0.28 * crown_after_ath_score
+        + 0.17 * drawdown_to_base_score
+        + 0.11 * dump_speed_score
+        + 0.10 * not_dead_after_dump_score
+        + 0.10 * base_survival_score
+        + 0.02 * right_spike_bonus
+    ) * mandatory_phase_mask * 100.0
 
     return {
-        "listing_to_ath_score": round(listing_to_ath_score * order_ok, 4),
-        "crown_after_ath_score": round(crown_after_ath_score * order_ok, 4),
-        "drawdown_to_base_score": round(drawdown_to_base_score * order_ok, 4),
-        "not_dead_after_dump_score": round(not_dead_after_dump_score * order_ok, 4),
-        "base_survival_score": round(base_survival_score * order_ok, 4),
+        "listing_to_ath_score": round(listing_to_ath_score, 4),
+        "crown_after_ath_score": round(crown_after_ath_score, 4),
+        "drawdown_to_base_score": round(drawdown_to_base_score, 4),
+        "not_dead_after_dump_score": round(not_dead_after_dump_score, 4),
+        "base_survival_score": round(base_survival_score, 4),
         "dump_to_zero_penalty": round(dump_to_zero_penalty, 4),
         "road_fit_score": round(road_fit_score, 2),
     }
+
 
 
 def find_best_window(closes: list[float], min_age_days: int, max_age_days: int, stage_mode: str = "legacy"):
@@ -1681,6 +1773,12 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                 pre_breakout_base_score=float(best["pre_breakout_base_score"]),
                 distance_to_siren_breakdown=float(best["distance_to_siren_breakdown"]),
                 distance_to_river_breakdown=float(best["distance_to_river_breakdown"]),
+                listing_to_ath_score=float(best["listing_to_ath_score"]),
+                crown_after_ath_score=float(best["crown_after_ath_score"]),
+                drawdown_to_base_score=float(best["drawdown_to_base_score"]),
+                not_dead_after_dump_score=float(best["not_dead_after_dump_score"]),
+                base_survival_score=float(best["base_survival_score"]),
+                road_fit_score=float(best["road_fit_score"]),
             )
 
             label_before_final_gate = final_label if final_label != "reject" else str(best["base_label"])

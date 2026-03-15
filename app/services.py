@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, date
 from typing import Dict, Optional
 
 import httpx
@@ -87,6 +88,20 @@ def age_from_chart_days(chart: dict) -> int | None:
     age_days = int((last_ts_ms - first_ts_ms) / 86_400_000)
     return max(age_days, 0)
 
+
+
+
+def listing_date_from_chart(chart: dict) -> date | None:
+    prices = chart.get("prices", [])
+    if not prices:
+        return None
+    first_ts_ms = prices[0][0]
+    if first_ts_ms is None:
+        return None
+    try:
+        return datetime.utcfromtimestamp(first_ts_ms / 1000.0).date()
+    except Exception:
+        return None
 
 def generate_window_lengths(min_age_days: int, max_age_days: int) -> list[int]:
     candidates = [30, 45, 60, 75, 90, 120, 150, 180, 210, 240, 300, 360]
@@ -1618,6 +1633,52 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                     auth_header_name=fetch.auth_header_name,
                     universe_filter_status="included_for_scoring",
                     universe_filter_reason="included_for_scoring",
+                )
+                continue
+
+            listing_date = listing_date_from_chart(chart)
+            if listing_date is None:
+                mark_skipped(
+                    asset_key=asset_key,
+                    coingecko_id=coin_id,
+                    reason="history_bad_response_schema",
+                    stage="fetch_market_data",
+                    skipped_assets=skipped_assets,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
+                    endpoint=fetch.endpoint,
+                    http_status=fetch.http_status,
+                    request_params=fetch.request_params,
+                    error_message="unable to derive listing date from chart",
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
+                    universe_filter_status="included_for_scoring",
+                    universe_filter_reason="included_for_scoring",
+                )
+                continue
+
+            cutoff_date = datetime.strptime(settings.min_listing_date_after, "%Y-%m-%d").date()
+            if listing_date <= cutoff_date:
+                mark_skipped(
+                    asset_key=asset_key,
+                    coingecko_id=coin_id,
+                    reason="excluded_before_listing_cutoff",
+                    stage="fetch_market_data",
+                    skipped_assets=skipped_assets,
+                    skip_reasons=skip_reasons,
+                    debug_by_symbol=debug_by_symbol,
+                    endpoint=fetch.endpoint,
+                    http_status=fetch.http_status,
+                    request_params=fetch.request_params,
+                    error_message=f"listing date {listing_date.isoformat()} is not after cutoff {cutoff_date.isoformat()}",
+                    auth_mode=fetch.auth_mode,
+                    base_url=fetch.base_url,
+                    api_key_present=fetch.api_key_present,
+                    auth_header_name=fetch.auth_header_name,
+                    universe_filter_status="excluded_before_listing_cutoff",
+                    universe_filter_reason="excluded_before_listing_cutoff",
                 )
                 continue
 

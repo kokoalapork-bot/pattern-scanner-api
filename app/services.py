@@ -104,16 +104,21 @@ def listing_date_from_chart(chart: dict) -> date | None:
         return None
 
 def generate_window_lengths(min_age_days: int, max_age_days: int) -> list[int]:
-    candidates = [30, 45, 60, 75, 90, 120, 150, 180, 210, 240, 300, 360]
+    # Recently-added listings often have usable structure before 30 daily closes.
+    # Allow shorter early-stage windows so new assets can reach scoring instead of
+    # being rejected in build_windows.
+    candidates = [14, 18, 21, 24, 28, 30, 36, 45, 60, 75, 90, 120, 150, 180, 210, 240, 300, 360]
     out = [w for w in candidates if min_age_days <= w <= max_age_days]
     if not out:
-        out = [max(30, min(max_age_days, 60))]
+        fallback = min(max_age_days, max(14, min_age_days))
+        out = [fallback]
     return out
 
 
 def iter_windows(closes: list[float], min_age_days: int, max_age_days: int):
     n = len(closes)
-    if n < max(30, min_age_days):
+    min_history_needed = max(14, min_age_days)
+    if n < min_history_needed:
         return
 
     window_lengths = generate_window_lengths(min_age_days, max_age_days)
@@ -1590,7 +1595,7 @@ async def scan_pattern(req: ScanRequest) -> ScanResponse | CompactScanResponse:
                 )
                 continue
 
-            min_required_closes = 14 if (req.stage_mode == "pre_breakout_only" or manual_input) else 30
+            min_required_closes = 10 if (req.stage_mode == "pre_breakout_only" or manual_input) else 24
             if len(closes) < min_required_closes:
                 mark_skipped(
                     asset_key=asset_key,

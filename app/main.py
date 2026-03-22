@@ -1,4 +1,4 @@
-"""FastAPI entrypoint for the pattern scanner service."""
+"FastAPI entrypoint for the pattern scanner service."
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -23,14 +23,17 @@ class RootResponse(BaseModel):
     openapi: str
     default_min_age_days: int
     default_max_age_days: int
+    supported_universe_providers: list[str]
+    supported_history_providers: list[str]
 
 
 app = FastAPI(
     title="Crypto Pattern Scanner API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Scans crypto assets for the crown-shelf-right-spike base structure. "
-        "Supports both symbol-based resolution and direct CoinGecko ids."
+        "Supports CoinGecko and CoinMarketCap for market universe discovery, "
+        "and CoinGecko for historical chart scoring on free plans."
     ),
     servers=[{"url": BASE_URL}],
 )
@@ -45,6 +48,8 @@ async def root() -> RootResponse:
         openapi="/openapi.json",
         default_min_age_days=14,
         default_max_age_days=394,
+        supported_universe_providers=["coingecko", "coinmarketcap"],
+        supported_history_providers=["auto", "coingecko", "coinmarketcap"],
     )
 
 
@@ -53,7 +58,7 @@ async def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         service="crypto-pattern-scanner",
-        version="1.0.0",
+        version="1.1.0",
     )
 
 

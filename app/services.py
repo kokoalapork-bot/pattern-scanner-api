@@ -168,7 +168,9 @@ async def scan_pattern(req: ScanRequest):
         except httpx.HTTPError:
             continue
 
-        prices = [p[1] for p in history.get("prices", []) if isinstance(p, list) and len(p) >= 2]
+        price_rows = [p for p in history.get("prices", []) if isinstance(p, list) and len(p) >= 2]
+        prices = [p[1] for p in price_rows]
+        timestamps_ms = [int(p[0]) for p in price_rows]
         if len(prices) < 30:
             continue
 
@@ -178,7 +180,7 @@ async def scan_pattern(req: ScanRequest):
         if not (req.min_age_days <= age_days <= req.max_age_days):
             continue
 
-        score = score_crown_shelf_right_spike(prices)
+        score = score_crown_shelf_right_spike(prices, timestamps_ms=timestamps_ms, coin_id=coin_id)
         evaluated.append(
             ScanResult(
                 coingecko_id=coin_id,

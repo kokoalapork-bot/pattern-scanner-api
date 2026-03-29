@@ -1,75 +1,178 @@
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from typing import Any, Dict, Literal, Optional
 
-from .models import CompactScanResponse, ErrorResponse, ScanRequest, ScanResponse
-from .services import scan_pattern
-
-BASE_URL = "https://pattern-scanner-api.onrender.com"
+from pydantic import BaseModel, ConfigDict, Field
 
 
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-    version: str
+PatternName = Literal["crown_shelf_right_spike"]
+StageMode = Literal["legacy", "pre_breakout_only"]
 
 
-class RootResponse(BaseModel):
-    message: str
-    docs: str
-    health: str
-    openapi: str
-    default_min_age_days: int
-    default_max_age_days: int
-    supported_universe_providers: list[str]
-    supported_history_providers: list[str]
-
-
-app = FastAPI(
-    title="Crypto Pattern Scanner API",
-    version="1.2.1",
-    description=(
-        "Scans crypto assets for the crown-shelf-right-spike base structure. "
-        "Uses CoinGecko for market universe discovery and historical chart scoring."
-    ),
-    servers=[{"url": BASE_URL}],
-)
-
-
-@app.get("/", response_model=RootResponse)
-async def root() -> RootResponse:
-    return RootResponse(
-        message="Crypto Pattern Scanner API is running.",
-        docs="/docs",
-        health="/health",
-        openapi="/openapi.json",
-        default_min_age_days=14,
-        default_max_age_days=450,
-        supported_universe_providers=["coingecko"],
-        supported_history_providers=["coingecko"],
+class ScanRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "pattern_name": "crown_shelf_right_spike",
+                    "min_age_days": 14,
+                    "max_age_days": 394,
+                    "top_k": 30,
+                    "max_coins_to_evaluate": 300,
+                    "vs_currency": "usd",
+                    "include_notes": True,
+                    "market_offset": 0,
+                    "market_batch_size": 20,
+                    "return_pre_filter_candidates": True,
+                    "compact_response": False,
+                },
+                {
+                    "pattern_name": "crown_shelf_right_spike",
+                    "min_age_days": 14,
+                    "max_age_days": 394,
+                    "top_k": 30,
+                    "max_coins_to_evaluate": 300,
+                    "vs_currency": "usd",
+                    "include_notes": True,
+                    "coingecko_ids": ["bitcoin", "ethereum"],
+                    "compact_response": True,
+                },
+            ]
+        }
     )
 
+    pattern_name: PatternName = "crown_shelf_right_spike"
+    min_age_days: int = Field(default=14, ge=1, le=5000)
+    max_age_days: int = Field(default=394, ge=1, le=5000)
+    top_k: int = Field(default=30, ge=1, le=100)
+    max_coins_to_evaluate: int = Field(default=300, ge=1, le=500)
+    vs_currency: str = Field(default="usd")
+    include_notes: bool = True
+    debug: bool = False
+    symbols: Optional[list[str]] = Field(default=None)
+    coingecko_ids: Optional[list[str]] = Field(default=None)
+    exclude_symbols: Optional[list[str]] = Field(default=None)
+    market_offset: int = Field(default=0, ge=0)
+    market_batch_size: Optional[int] = Field(default=None, ge=1, le=500)
+    return_pre_filter_candidates: bool = True
+    compact_response: bool = False
+    stage_mode: StageMode = "legacy"
 
-@app.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse:
-    return HealthResponse(
-        status="ok",
-        service="crypto-pattern-scanner",
-        version="1.2.1",
-    )
+
+class MatchBreakdown(BaseModel):
+    crown: float
+    drop: float
+    shelf: float
+    right_spike: float
+    reversion: float
+    asymmetry: float
+    template_shape: float
 
 
-@app.post(
-    "/scan",
-    response_model=ScanResponse | CompactScanResponse,
-    responses={400: {"model": ErrorResponse}},
-)
-async def scan(req: ScanRequest):
-    try:
-        return await scan_pattern(req)
-    except ValueError as exc:
-        return JSONResponse(
-            status_code=400,
-            content=ErrorResponse(detail=str(exc)).model_dump(),
-        )
+class BestWindow(BaseModel):
+    start_idx: int
+    end_idx: int
+    length_days: int
+    best_age_days: int
+    candidate_windows_count: int
+
+
+class DebugSymbolInfo(BaseModel):
+    input_symbol: str | None = None
+    input_coingecko_id: str | None = None
+    source_type: str | None = None
+    resolved: bool = False
+    coingecko_id: str | None = None
+    status: str = "unknown"
+    stage: str = "unknown"
+    reason: str | None = None
+    endpoint: str | None = None
+    http_status: int | None = None
+    request_params: Dict[str, Any] | None = None
+    error_message: str | None = None
+    auth_mode: str | None = None
+    base_url: str | None = None
+    api_key_present: bool | None = None
+    auth_header_name: str | None = None
+    universe_filter_status: str | None = None
+    universe_filter_reason: str | None = None
+    candidate_windows_count: int | None = None
+    best_window: Dict[str, Any] | None = None
+    structural_score: float | None = None
+    raw_similarity: float | None = None
+    label: str | None = None
+
+
+class ScanResult(BaseModel):
+    coingecko_id: str
+    symbol: str
+    name: str
+    age_days: int
+    market_cap_usd: float | None = None
+    volume_24h_usd: float | None = None
+    similarity: float
+    raw_similarity: float
+    label: str
+    label_before_final_gate: str | None = None
+    stage: str
+    structural_score: float
+    exemplar_consistency_score: float = 0.0
+    distance_to_siren_breakdown: float = 0.0
+    distance_to_river_breakdown: float = 0.0
+    reference_band_passed: bool = True
+    pre_breakout_base_score: float | None = None
+    early_impulse_score: float | None = None
+    return_to_base_score: float | None = None
+    base_duration_score: float | None = None
+    base_compaction_score: float | None = None
+    right_side_tightening_score: float | None = None
+    breakout_not_started_score: float | None = None
+    late_breakout_penalty: float | None = None
+    post_breakout_extension_penalty: float | None = None
+    selected_window_stage: str | None = None
+    universe_filter_status: str = "passed"
+    universe_filter_reason: str = ""
+    breakdown: MatchBreakdown
+    best_window: BestWindow
+    notes: list[str] = Field(default_factory=list)
+    source: str = "coingecko"
+
+
+class CompactScanResult(BaseModel):
+    coingecko_id: str
+    symbol: str
+    name: str
+    similarity: float
+    age_days: int
+    label: str
+
+
+class ScanResponse(BaseModel):
+    pattern_name: PatternName
+    universe_provider: str = "coingecko"
+    history_provider: str = "coingecko"
+    evaluated_count: int
+    returned_count: int
+    market_offset: int = 0
+    market_batch_size: int = 0
+    pages_scanned: int = 0
+    total_candidates_seen: int = 0
+    results: list[ScanResult]
+    pre_filter_candidates: list[ScanResult] = Field(default_factory=list)
+    debug_by_symbol: Dict[str, DebugSymbolInfo] = Field(default_factory=dict)
+
+
+class CompactScanResponse(BaseModel):
+    pattern_name: PatternName
+    universe_provider: str = "coingecko"
+    history_provider: str = "coingecko"
+    evaluated_count: int
+    returned_count: int
+    market_offset: int = 0
+    market_batch_size: int = 0
+    pages_scanned: int = 0
+    total_candidates_seen: int = 0
+    results: list[CompactScanResult]
+
+
+class ErrorResponse(BaseModel):
+    detail: str

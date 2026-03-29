@@ -1,10 +1,24 @@
 
-from app.patterns import score_crown_shelf_right_spike
+import asyncio
+import httpx
 
 
-def test_score_returns_valid_result():
-    prices = [10, 12, 15, 17, 16, 13, 11, 10, 9, 9.5, 10, 10.2, 10.1, 10.0, 10.3, 14, 18, 12, 10.4, 10.2]
-    prices = prices + [10.1] * 15
-    result = score_crown_shelf_right_spike(prices)
-    assert 0 <= result.similarity <= 100
-    assert result.label in {"strong match", "partial match", "weak match"}
+async def main() -> None:
+    payload = {
+        "pattern_name": "crown_shelf_right_spike",
+        "min_age_days": 14,
+        "max_age_days": 450,
+        "top_k": 5,
+        "max_coins_to_evaluate": 50,
+        "vs_currency": "usd",
+        "include_notes": True,
+    }
+
+    async with httpx.AsyncClient(base_url="http://localhost:8000", timeout=30) as client:
+        response = await client.post("/scan", json=payload)
+        response.raise_for_status()
+        print(response.json())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -62,3 +62,12 @@ curl -X POST "http://localhost:8000/scan" \
 - debug_by_symbol показывает точную причину, если символ отвалился до оценки
 - жесткие overrides для RIVER -> river и SIREN -> siren-2
 - end-to-end тест scan_pattern с mock CoinGecko client
+
+
+## Deploy on Render
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+If you deploy from GitHub on Render, the repository root must contain `requirements.txt`.

@@ -1,8 +1,7 @@
+# README_FIXES
 
-from app.config import get_settings
-
-
-def test_settings_defaults():
-    settings = get_settings()
-    assert settings.default_min_age_days >= 1
-    assert settings.default_max_age_days >= settings.default_min_age_days
+Этот пакет собран как рабочая восстановленная версия репозитория:
+- структура файлов сохранена
+- API-эндпоинты `/`, `/health`, `/scan` работают
+- добавлены базовые тесты
+- используется CoinGecko как источник рынка и истории

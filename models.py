@@ -1,30 +1,10 @@
-
-from functools import lru_cache
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
-
-    host: str = "0.0.0.0"
-    port: int = 8000
-
-    coingecko_api_key: str | None = None
-    request_timeout_seconds: int = 30
-    user_agent: str = "pattern-scanner-api/1.2.1"
-
-    default_top_k: int = 20
-    default_min_age_days: int = 14
-    default_max_age_days: int = 450
-    default_max_coins_to_evaluate: int = 250
-
-    min_market_cap_usd: float = 1_000_000
-    min_24h_volume_usd: float = 100_000
-
-    exclude_stables: bool = True
-    exclude_tokenized_stocks: bool = True
-
-
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    return Settings()
+[
+  "app/tests/test_config_validation.py::test_settings_defaults",
+  "app/tests/test_pattern_scan.py::test_score_returns_valid_result",
+  "app/tests/test_reference_mode.py::test_general_reference_like_shape_scores_reasonably",
+  "app/tests/test_reference_mode.py::test_reference_coin_passes_on_reference_window",
+  "app/tests/test_resolution_and_age.py::test_age_days_from_history_uses_first_candle",
+  "app/tests/test_resolution_and_age.py::test_resolve_symbol_prefers_better_ranked_exact_match",
+  "app/tests/test_scan_references_end_to_end.py::test_explicit_reference_symbols_are_evaluated",
+  "app/tests/test_startup_import.py::test_app_import"
+]

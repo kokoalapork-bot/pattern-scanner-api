@@ -16,7 +16,7 @@ from .models import (
     ScanResponse,
     ScanResult,
 )
-from .patterns import score_crown_shelf_right_spike
+from .patterns import MIN_ALLOWED_FIRST_HISTORY_DATE, REFERENCE_WINDOWS, _ms, score_crown_shelf_right_spike
 
 
 STABLE_KEYWORDS = {
@@ -85,6 +85,7 @@ async def _collect_universe(
     client: CoinGeckoClient,
     debug_by_symbol: dict[str, DebugSymbolInfo],
 ) -> tuple[list[dict[str, Any]], int, int]:
+    settings = get_settings()
     if req.coingecko_ids:
         items: list[dict[str, Any]] = []
         for coin_id in req.coingecko_ids:
@@ -160,6 +161,21 @@ def _age_days_from_history(history: dict[str, Any]) -> int | None:
         ts_ms = int(first[0])
         first_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
         return max(0, (datetime.now(timezone.utc) - first_dt).days)
+    except Exception:
+        return None
+
+
+
+
+def _first_history_timestamp(history: dict[str, Any]) -> int | None:
+    prices = history.get("prices", [])
+    if not prices:
+        return None
+    first = prices[0]
+    if not (isinstance(first, list) and len(first) >= 2):
+        return None
+    try:
+        return int(first[0])
     except Exception:
         return None
 
@@ -250,14 +266,25 @@ async def scan_pattern(req: ScanRequest, client: CoinGeckoClient | None = None):
             continue
 
         timestamps = [int(p[0]) for p in history.get("prices", []) if isinstance(p, list) and len(p) >= 2]
+        first_ts = _first_history_timestamp(history)
+        if first_ts is None:
+            if dbg:
+                dbg.status = "skipped"
+                dbg.reason = "first history timestamp unavailable"
+            continue
+        if first_ts < _ms(MIN_ALLOWED_FIRST_HISTORY_DATE) and coin_id not in REFERENCE_WINDOWS:
+            if dbg:
+                dbg.status = "skipped"
+                dbg.reason = f"first history date older than {MIN_ALLOWED_FIRST_HISTORY_DATE}"
+            continue
+
         score = score_crown_shelf_right_spike(prices, timestamps=timestamps, coin_id=coin_id)
         if score.similarity <= 0:
             if dbg:
-                dbg.status = "skipped"
-                dbg.reason = "; ".join(score.notes) if score.notes else "failed hard pattern gates"
+                dbg.status = "filtered"
+                dbg.reason = "; ".join(score.notes)
                 dbg.stage = score.stage
             continue
-
         result = ScanResult(
             coingecko_id=coin_id,
             symbol=symbol_upper,

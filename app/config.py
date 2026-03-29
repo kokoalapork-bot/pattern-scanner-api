@@ -28,7 +28,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("COINGECKO_API_PLAN",),
     )
     request_timeout_seconds: int = 30
-    user_agent: str = "pattern-scanner-api/1.2.9"
+    user_agent: str = "pattern-scanner-api/1.2.4"
 
     default_top_k: int = 20
     default_min_age_days: int = 14

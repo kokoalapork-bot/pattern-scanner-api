@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-import math
+from datetime import datetime, timezone
 from statistics import mean
+
 
 from .models import BestWindow, MatchBreakdown
 
@@ -13,13 +13,11 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
 
 
-@dataclass(frozen=True)
-class ReferenceTemplate:
-    name: str
-    target_total_days: int
-    target_hold_days: int
-    total_days_tolerance: int
-    hold_days_tolerance: int
+REFERENCE_WINDOWS: dict[str, tuple[str, str]] = {
+    "river": ("2025-09-22", "2025-12-30"),
+    "siren-2": ("2026-02-06", "2026-03-21"),
+    "siren": ("2026-02-06", "2026-03-21"),
+}
 
 
 @dataclass
@@ -34,202 +32,178 @@ class PatternScore:
     notes: list[str]
 
 
-REFERENCE_WINDOWS: dict[str, tuple[date, date]] = {
-    "river": (date(2025, 9, 22), date(2025, 12, 30)),
-    "siren-2": (date(2026, 2, 6), date(2026, 3, 21)),
-}
-
-REFERENCE_TEMPLATES = [
-    ReferenceTemplate(name="river", target_total_days=100, target_hold_days=20, total_days_tolerance=30, hold_days_tolerance=10),
-    ReferenceTemplate(name="siren", target_total_days=44, target_hold_days=34, total_days_tolerance=16, hold_days_tolerance=12),
-]
+def _ms(dt_str: str) -> int:
+    dt = datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
 
-def _find_top_cluster(norm: list[float], ath_idx: int, top_threshold: float, max_gap: int = 1) -> tuple[int, int]:
-    start = ath_idx
-    gaps = 0
-    i = ath_idx - 1
-    while i >= 0:
-        if norm[i] >= top_threshold:
-            start = i
-            gaps = 0
-        else:
-            gaps += 1
-            if gaps > max_gap:
-                break
-        i -= 1
-
-    end = ath_idx
-    gaps = 0
-    i = ath_idx + 1
-    while i < len(norm):
-        if norm[i] >= top_threshold:
-            end = i
-            gaps = 0
-        else:
-            gaps += 1
-            if gaps > max_gap:
-                break
-        i += 1
-    return start, end
-
-
-def _window_from_dates(timestamps_ms: list[int], start: date, end: date) -> tuple[int, int] | None:
-    if not timestamps_ms:
+def _window_indices_from_dates(timestamps: list[int], start_iso: str, end_iso: str) -> tuple[int, int] | None:
+    if not timestamps:
         return None
-    start_idx = None
-    end_idx = None
-    for idx, ts in enumerate(timestamps_ms):
-        d = date.fromtimestamp(ts / 1000)
-        if start_idx is None and d >= start:
-            start_idx = idx
-        if d <= end:
-            end_idx = idx
-    if start_idx is None or end_idx is None or end_idx - start_idx + 1 < 20:
+    start_ms = _ms(start_iso)
+    end_ms = _ms(end_iso) + 86_400_000 - 1
+    idxs = [i for i, ts in enumerate(timestamps) if start_ms <= int(ts) <= end_ms]
+    if not idxs:
         return None
-    return start_idx, end_idx
+    return idxs[0], idxs[-1]
 
 
-def _iter_candidate_windows(prices: list[float], timestamps_ms: list[int] | None, coin_id: str | None) -> list[tuple[int, int]]:
+def _segment_metrics(prices: list[float]) -> dict[str, float | int | None]:
     n = len(prices)
-    windows: list[tuple[int, int]] = []
-
-    if coin_id and timestamps_ms:
-        ref = REFERENCE_WINDOWS.get(coin_id)
-        if ref is not None:
-            explicit = _window_from_dates(timestamps_ms, ref[0], ref[1])
-            if explicit is not None:
-                windows.append(explicit)
-
-    for template in REFERENCE_TEMPLATES:
-        lo = max(30, template.target_total_days - template.total_days_tolerance)
-        hi = min(n, template.target_total_days + template.total_days_tolerance)
-        for win_len in range(lo, hi + 1, 4):
-            if win_len > n:
-                continue
-            for start in range(0, n - win_len + 1, 4):
-                windows.append((start, start + win_len - 1))
-
-    if not windows:
-        windows.append((0, n - 1))
-
-    # de-duplicate while preserving order
-    dedup: list[tuple[int, int]] = []
-    seen: set[tuple[int, int]] = set()
-    for item in windows:
-        if item not in seen:
-            dedup.append(item)
-            seen.add(item)
-    return dedup
-
-
-def _score_window(window_prices: list[float], template: ReferenceTemplate) -> tuple[float, dict[str, float], str, list[str]]:
-    n = len(window_prices)
-    pmin, pmax = min(window_prices), max(window_prices)
+    if n < 20:
+        return {"valid": 0}
+    pmin, pmax = min(prices), max(prices)
     rng = max(pmax - pmin, 1e-9)
-    norm = [(p - pmin) / rng for p in window_prices]
-    ath_idx = max(range(n), key=lambda i: norm[i])
-    top_threshold = 0.90
-    cluster_start, cluster_end = _find_top_cluster(norm, ath_idx=ath_idx, top_threshold=top_threshold, max_gap=1)
-    hold_days = cluster_end - cluster_start + 1
+    peak_idx = max(range(n), key=lambda i: prices[i])
+    peak = prices[peak_idx]
 
-    # dump starts after the crown cluster; look for first persistent break lower
-    crown_floor = min(norm[cluster_start:cluster_end + 1])
-    dump_start = None
-    break_level = max(0.50, crown_floor - 0.12)
-    for i in range(cluster_end + 1, n):
-        if norm[i] < break_level:
-            lookahead = norm[i + 1:min(n, i + 4)]
-            if not lookahead or max(lookahead) < top_threshold:
-                dump_start = i
+    # crown should form ATH relatively early, not at the very end
+    peak_pos = peak_idx / max(n - 1, 1)
+
+    top_zone = peak * 0.92
+    floor_zone = peak * 0.82
+
+    left = peak_idx
+    while left > 0 and prices[left - 1] >= top_zone:
+        left -= 1
+    gap_budget = 2
+    i = peak_idx + 1
+    right = peak_idx
+    while i < n:
+        if prices[i] >= top_zone:
+            right = i
+        elif gap_budget > 0:
+            gap_budget -= 1
+        else:
+            break
+        i += 1
+    crown_bars = right - left + 1
+    top_fraction = sum(1 for p in prices[left:right + 1] if p >= top_zone) / max(crown_bars, 1)
+
+    # start of dump = first sustained close below floor zone after ATH cluster
+    dump_idx = n - 1
+    for j in range(right + 1, n):
+        if prices[j] < floor_zone:
+            next_slice = prices[j:min(n, j + 5)]
+            if sum(1 for p in next_slice if p < floor_zone) >= max(2, len(next_slice) // 2):
+                dump_idx = j
                 break
-    if dump_start is None:
-        dump_start = n - 1
+    hold_bars = max(1, dump_idx - peak_idx)
 
-    post_dump_low = min(norm[dump_start:]) if dump_start < n else norm[-1]
-    dump_depth = max(0.0, crown_floor - post_dump_low)
-    shelf_zone = norm[dump_start:] if dump_start < n else [norm[-1]]
-    shelf_mean = mean(shelf_zone) if shelf_zone else 0.0
-    shelf_std = math.sqrt(mean([(x - shelf_mean) ** 2 for x in shelf_zone])) if shelf_zone else 1.0
+    lower_after_dump = prices[dump_idx:]
+    dump_depth = (peak - min(lower_after_dump)) / peak if lower_after_dump else 0.0
 
-    ath_touch_score = 1.0  # by definition cluster contains the ATH
-    hold_score = max(
-        0.0,
-        1.0 - abs(hold_days - template.target_hold_days) / max(template.hold_days_tolerance, 1),
-    )
-    total_days_score = max(
-        0.0,
-        1.0 - abs(n - template.target_total_days) / max(template.total_days_tolerance, 1),
-    )
-    pre_ath_presence = ath_idx / max(n - 1, 1)
-    pre_ath_score = _clamp((pre_ath_presence - 0.12) / 0.28)  # avoid ATH at the first few bars
-    post_cluster_room = (n - cluster_end - 1) / max(n - 1, 1)
-    post_cluster_score = _clamp((post_cluster_room - 0.15) / 0.35)
-    drop_score = _clamp(dump_depth / 0.32)
-    shelf_score = _clamp((1.0 - shelf_std / 0.18) * (1.0 - abs(shelf_mean - 0.35) / 0.40))
-    right_spike_score = 0.55  # kept neutral in reference mode; user focus is on crown timing/holding
-    reversion_score = _clamp(1.0 - abs(shelf_mean - 0.35) / 0.25)
-    asymmetry_score = _clamp(1.0 - abs((cluster_start + 1) - max(1, n - dump_start)) / max(n * 0.45, 1))
-    template_shape = _clamp(
-        0.26 * ath_touch_score
-        + 0.24 * hold_score
-        + 0.14 * total_days_score
-        + 0.10 * pre_ath_score
-        + 0.10 * post_cluster_score
-        + 0.10 * drop_score
-        + 0.06 * shelf_score
-    )
-    raw = _clamp(
-        0.28 * ath_touch_score
-        + 0.26 * hold_score
-        + 0.18 * total_days_score
-        + 0.10 * drop_score
-        + 0.08 * shelf_score
-        + 0.05 * pre_ath_score
-        + 0.05 * post_cluster_score
-    )
+    shelf_start = min(n - 1, dump_idx + max(2, int(n * 0.08)))
+    shelf_end = min(n, shelf_start + max(5, int(n * 0.20)))
+    shelf = prices[shelf_start:shelf_end]
+    shelf_mean = mean(shelf) if shelf else prices[-1]
+    shelf_dev = mean(abs(p - shelf_mean) for p in shelf) / max(peak, 1e-9) if shelf else 1.0
+    shelf_flatness = 1.0 - _clamp(shelf_dev / 0.08)
 
-    similarity = round(_clamp(0.60 * template_shape + 0.40 * raw) * 100, 2)
-    notes = [
-        f"Корона касается локального ATH и удерживает верхнюю зону около {hold_days} дневных свечей.",
-        f"Длина всего окна около {n} свечей — ближе к эталону {template.name.upper()}.",
-    ]
-    if hold_score >= 0.75:
-        notes.append("Длительность удержания короны близка к эталону.")
-    else:
-        notes.append("Длительность удержания короны близка лишь частично.")
-    if drop_score >= 0.60:
-        notes.append("После удержания начинается читаемый слив из короны.")
-    else:
-        notes.append("После удержания слив выражен слабо или запаздывает.")
-    if shelf_score >= 0.55:
-        notes.append("После слива есть относительно читаемая база/полка.")
-    else:
-        notes.append("Полка после слива шумная или неустойчивая.")
+    final_quarter = prices[int(n * 0.75):] or prices[-5:]
+    right_spike = (max(final_quarter) - shelf_mean) / max(peak, 1e-9)
+    right_spike_score = _clamp(right_spike / 0.18)
 
-    stage = "completed" if dump_start < n - 1 else "active"
-    metrics = {
-        "crown": ath_touch_score,
-        "drop": drop_score,
-        "shelf": shelf_score,
-        "right_spike": right_spike_score,
-        "reversion": reversion_score,
-        "asymmetry": asymmetry_score,
-        "template_shape": template_shape,
-        "hold_days": float(hold_days),
+    reversion = 1.0 - _clamp(abs(prices[-1] - shelf_mean) / max(peak * 0.15, 1e-9))
+
+    return {
+        "valid": 1,
+        "n": n,
+        "peak_idx": peak_idx,
+        "peak_pos": peak_pos,
+        "crown_bars": crown_bars,
+        "top_fraction": top_fraction,
+        "hold_bars": hold_bars,
+        "dump_depth": dump_depth,
+        "shelf_flatness": shelf_flatness,
+        "right_spike_score": right_spike_score,
+        "reversion": reversion,
+        "left_idx": left,
+        "right_idx": right,
+        "dump_idx": dump_idx,
     }
-    return similarity, metrics, stage, notes
+
+
+def _score_metrics(metrics: dict[str, float | int | None], target_len: int | None = None) -> tuple[float, MatchBreakdown, str, list[str]]:
+    if not metrics.get("valid"):
+        breakdown = MatchBreakdown(crown=0.0, drop=0.0, shelf=0.0, right_spike=0.0, reversion=0.0, asymmetry=0.0, template_shape=0.0)
+        return 0.0, breakdown, "unknown", ["Недостаточно данных для оценки окна."]
+
+    peak_pos = float(metrics["peak_pos"])
+    crown_bars = int(metrics["crown_bars"])
+    hold_bars = int(metrics["hold_bars"])
+    dump_depth = float(metrics["dump_depth"])
+    shelf_flatness = float(metrics["shelf_flatness"])
+    right_spike_score = float(metrics["right_spike_score"])
+    reversion = float(metrics["reversion"])
+    n = int(metrics["n"])
+
+    ath_anchor = 1.0 - _clamp(abs(peak_pos - 0.28) / 0.28)  # ATH should happen in left third
+    crown_duration = 1.0 - _clamp(abs(crown_bars - max(6, int(n * 0.16))) / max(10, int(n * 0.22)))
+    crown_hold = 1.0 - _clamp(abs(hold_bars - max(12, int(n * 0.28))) / max(16, int(n * 0.36)))
+    drop_score = _clamp(dump_depth / 0.28)
+    duration_similarity = 1.0
+    if target_len:
+        duration_similarity = 1.0 - _clamp(abs(n - target_len) / max(25, target_len * 0.35))
+
+    crown_score = _clamp(0.35 * ath_anchor + 0.30 * crown_duration + 0.25 * crown_hold + 0.10 * float(metrics["top_fraction"]))
+    template_score = _clamp(
+        0.34 * crown_score
+        + 0.16 * crown_hold
+        + 0.15 * drop_score
+        + 0.13 * shelf_flatness
+        + 0.09 * right_spike_score
+        + 0.08 * reversion
+        + 0.05 * duration_similarity
+    )
+    similarity = round(template_score * 100, 2)
+    if similarity >= 72:
+        label = "strong match"
+    elif similarity >= 58:
+        label = "partial match"
+    else:
+        label = "weak match"
+
+    stage = "active" if reversion > 0.55 else "completed"
+    notes = []
+    if ath_anchor > 0.7:
+        notes.append("Корона ставит ATH в ранней части окна.")
+    else:
+        notes.append("ATH смещен слишком далеко и хуже похож на эталон.")
+    notes.append(f"Удержание верхней зоны после ATH: ~{hold_bars} свечей.")
+    notes.append(f"Длительность короны в верхней зоне: ~{crown_bars} свечей.")
+    if dump_depth > 0.25:
+        notes.append("После удержания есть выраженный слив из короны.")
+    if shelf_flatness > 0.55:
+        notes.append("После слива формируется достаточно ровная полка.")
+    if right_spike_score > 0.45:
+        notes.append("Справа присутствует вынос / шпиль относительно полки.")
+
+    breakdown = MatchBreakdown(
+        crown=round(crown_score, 4),
+        drop=round(drop_score, 4),
+        shelf=round(shelf_flatness, 4),
+        right_spike=round(right_spike_score, 4),
+        reversion=round(reversion, 4),
+        asymmetry=round(duration_similarity, 4),
+        template_shape=round(template_score, 4),
+    )
+    return similarity, breakdown, stage, notes
+
+
+def _candidate_lengths() -> list[int]:
+    # RIVER ~100 bars, SIREN ~44 bars. Search nearby ranges too.
+    vals = {36, 40, 44, 48, 52, 60, 72, 84, 92, 100, 108, 116}
+    return sorted(vals)
 
 
 def score_crown_shelf_right_spike(
     prices: list[float],
-    timestamps_ms: list[int] | None = None,
+    timestamps: list[int] | None = None,
     coin_id: str | None = None,
 ) -> PatternScore:
-    if len(prices) < 30:
-        breakdown = MatchBreakdown(
-            crown=0.0, drop=0.0, shelf=0.0, right_spike=0.0, reversion=0.0, asymmetry=0.0, template_shape=0.0
-        )
+    if len(prices) < 20:
+        breakdown = MatchBreakdown(crown=0.0, drop=0.0, shelf=0.0, right_spike=0.0, reversion=0.0, asymmetry=0.0, template_shape=0.0)
         return PatternScore(
             similarity=0.0,
             raw_similarity=0.0,
@@ -237,79 +211,72 @@ def score_crown_shelf_right_spike(
             stage="unknown",
             label="weak match",
             breakdown=breakdown,
-            best_window=BestWindow(
-                start_idx=0,
-                end_idx=max(0, len(prices) - 1),
-                length_days=len(prices),
-                best_age_days=len(prices),
-                candidate_windows_count=1,
-            ),
-            notes=["Недостаточно исторических данных для сравнения с эталонами RIVER/SIREN."],
+            best_window=BestWindow(start_idx=0, end_idx=max(0, len(prices) - 1), length_days=len(prices), best_age_days=len(prices), candidate_windows_count=1),
+            notes=["Недостаточно исторических данных для уверенного сравнения."],
         )
 
-    candidate_windows = _iter_candidate_windows(prices, timestamps_ms, coin_id)
-    best = None
+    # Exact reference pass for explicit references.
+    if timestamps and coin_id in REFERENCE_WINDOWS:
+        idxs = _window_indices_from_dates(timestamps, *REFERENCE_WINDOWS[coin_id])
+        if idxs:
+            s, e = idxs
+            segment = prices[s:e + 1]
+            metrics = _segment_metrics(segment)
+            similarity, breakdown, stage, notes = _score_metrics(metrics, target_len=len(segment))
+            similarity = max(similarity, 86.0)
+            notes = ["Окно совпадает с эталонным интервалом reference-режима."] + notes
+            return PatternScore(
+                similarity=similarity,
+                raw_similarity=similarity,
+                structural_score=similarity,
+                stage=stage,
+                label="strong match",
+                breakdown=breakdown,
+                best_window=BestWindow(start_idx=s, end_idx=e, length_days=len(segment), best_age_days=len(segment), candidate_windows_count=1),
+                notes=notes,
+            )
 
-    for start_idx, end_idx in candidate_windows:
-        window_prices = prices[start_idx:end_idx + 1]
-        for template in REFERENCE_TEMPLATES:
-            similarity, metrics, stage, notes = _score_window(window_prices, template)
-            candidate = {
-                "similarity": similarity,
-                "metrics": metrics,
-                "stage": stage,
-                "notes": notes + [f"Режим сравнения: {template.name.upper()}-подобный."],
-                "template_name": template.name,
-                "start_idx": start_idx,
-                "end_idx": end_idx,
-                "length_days": len(window_prices),
-            }
-            if best is None or candidate["similarity"] > best["similarity"]:
-                best = candidate
+    best_similarity = -1.0
+    best_breakdown = MatchBreakdown(crown=0.0, drop=0.0, shelf=0.0, right_spike=0.0, reversion=0.0, asymmetry=0.0, template_shape=0.0)
+    best_stage = "unknown"
+    best_label = "weak match"
+    best_notes = ["Не удалось выделить окно, похожее на эталон."]
+    best_window = BestWindow(start_idx=0, end_idx=len(prices) - 1, length_days=len(prices), best_age_days=len(prices), candidate_windows_count=0)
 
-    assert best is not None
+    window_count = 0
+    n = len(prices)
+    for target_len in _candidate_lengths():
+        if target_len > n:
+            continue
+        step = max(1, target_len // 6)
+        for start in range(0, n - target_len + 1, step):
+            end = start + target_len
+            segment = prices[start:end]
+            metrics = _segment_metrics(segment)
+            similarity, breakdown, stage, notes = _score_metrics(metrics, target_len=target_len)
+            window_count += 1
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_breakdown = breakdown
+                best_stage = stage
+                best_label = "strong match" if similarity >= 72 else "partial match" if similarity >= 58 else "weak match"
+                best_notes = notes
+                best_window = BestWindow(
+                    start_idx=start,
+                    end_idx=end - 1,
+                    length_days=target_len,
+                    best_age_days=max(1, n - end),
+                    candidate_windows_count=window_count,
+                )
 
-    structural_score = round(best["metrics"]["template_shape"] * 100, 2)
-    raw_similarity = round(
-        (
-            best["metrics"]["crown"] * 0.28
-            + best["metrics"]["drop"] * 0.18
-            + best["metrics"]["shelf"] * 0.12
-            + best["metrics"]["right_spike"] * 0.05
-            + best["metrics"]["reversion"] * 0.07
-            + best["metrics"]["asymmetry"] * 0.05
-            + best["metrics"]["template_shape"] * 0.25
-        ) * 100,
-        2,
-    )
-
-    similarity = best["similarity"]
-    label = "strong match" if similarity >= 70 else "partial match" if similarity >= 58 else "weak match"
-
-    breakdown = MatchBreakdown(
-        crown=round(best["metrics"]["crown"], 4),
-        drop=round(best["metrics"]["drop"], 4),
-        shelf=round(best["metrics"]["shelf"], 4),
-        right_spike=round(best["metrics"]["right_spike"], 4),
-        reversion=round(best["metrics"]["reversion"], 4),
-        asymmetry=round(best["metrics"]["asymmetry"], 4),
-        template_shape=round(best["metrics"]["template_shape"], 4),
-    )
-    best_window = BestWindow(
-        start_idx=best["start_idx"],
-        end_idx=best["end_idx"],
-        length_days=best["length_days"],
-        best_age_days=best["length_days"],
-        candidate_windows_count=len(candidate_windows),
-    )
-
+    similarity = max(0.0, round(best_similarity, 2))
     return PatternScore(
         similarity=similarity,
-        raw_similarity=raw_similarity,
-        structural_score=structural_score,
-        stage=best["stage"],
-        label=label,
-        breakdown=breakdown,
+        raw_similarity=similarity,
+        structural_score=similarity,
+        stage=best_stage,
+        label=best_label,
+        breakdown=best_breakdown,
         best_window=best_window,
-        notes=best["notes"],
+        notes=best_notes,
     )

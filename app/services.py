@@ -145,6 +145,7 @@ async def scan_pattern(req: ScanRequest):
 
     universe, pages_scanned, total_candidates_seen = await _collect_universe(req, client)
     evaluated: list[ScanResult] = []
+    explicit_selection = bool(req.symbols or req.coingecko_ids)
     exclude_symbols_upper = {s.upper() for s in (req.exclude_symbols or [])}
 
     for coin in universe:
@@ -157,10 +158,11 @@ async def scan_pattern(req: ScanRequest):
 
         market_cap = coin.get("market_cap") or coin.get("market_cap_usd")
         volume = coin.get("total_volume") or coin.get("volume_24h_usd") or 0.0
-        if market_cap is not None and market_cap < settings.min_market_cap_usd:
-            continue
-        if volume is not None and volume < settings.min_24h_volume_usd:
-            continue
+        if not explicit_selection:
+            if market_cap is not None and market_cap < settings.min_market_cap_usd:
+                continue
+            if volume is not None and volume < settings.min_24h_volume_usd:
+                continue
 
         coin_id = coin["id"]
         try:
@@ -168,9 +170,7 @@ async def scan_pattern(req: ScanRequest):
         except httpx.HTTPError:
             continue
 
-        price_rows = [p for p in history.get("prices", []) if isinstance(p, list) and len(p) >= 2]
-        prices = [p[1] for p in price_rows]
-        timestamps_ms = [int(p[0]) for p in price_rows]
+        prices = [p[1] for p in history.get("prices", []) if isinstance(p, list) and len(p) >= 2]
         if len(prices) < 30:
             continue
 
@@ -180,7 +180,8 @@ async def scan_pattern(req: ScanRequest):
         if not (req.min_age_days <= age_days <= req.max_age_days):
             continue
 
-        score = score_crown_shelf_right_spike(prices, timestamps_ms=timestamps_ms, coin_id=coin_id)
+        timestamps = [int(p[0]) for p in history.get("prices", []) if isinstance(p, list) and len(p) >= 2]
+        score = score_crown_shelf_right_spike(prices, timestamps=timestamps, coin_id=coin_id)
         evaluated.append(
             ScanResult(
                 coingecko_id=coin_id,

@@ -1,0 +1,14 @@
+[
+  "app/tests/test_coingecko_demo_auth.py::test_fetch_market_chart_demo_caps_days_and_uses_demo_auth",
+  "app/tests/test_config_validation.py::test_settings_defaults",
+  "app/tests/test_pattern_scan.py::test_listing_ath_is_filtered",
+  "app/tests/test_pattern_scan.py::test_reference_river_passes",
+  "app/tests/test_pattern_scan.py::test_reference_siren_passes",
+  "app/tests/test_reference_mode.py::test_reference_coin_passes_on_reference_window",
+  "app/tests/test_reference_mode.py::test_strict_filters_reject_weak_general_shape",
+  "app/tests/test_resolution_and_age.py::test_age_days_from_history_uses_first_candle",
+  "app/tests/test_resolution_and_age.py::test_resolve_symbol_prefers_better_ranked_exact_match",
+  "app/tests/test_scan_references_end_to_end.py::test_explicit_reference_symbols_are_evaluated",
+  "app/tests/test_startup_import.py::test_app_import",
+  "app/tests/test_strict_metadata_prefilter.py::test_old_coins_are_rejected_by_metadata_prefilter"
+]

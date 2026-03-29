@@ -1,178 +1,147 @@
+from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional
+from datetime import datetime, timezone
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+import httpx
+
+from .config import get_settings
 
 
-PatternName = Literal["crown_shelf_right_spike"]
-StageMode = Literal["legacy", "pre_breakout_only"]
+PUBLIC_API_BASE = "https://api.coingecko.com/api/v3"
+PRO_API_BASE = "https://pro-api.coingecko.com/api/v3"
 
 
-class ScanRequest(BaseModel):
-    model_config = ConfigDict(
-        json_schema_extra={
-            "examples": [
-                {
-                    "pattern_name": "crown_shelf_right_spike",
-                    "min_age_days": 14,
-                    "max_age_days": 394,
-                    "top_k": 30,
-                    "max_coins_to_evaluate": 300,
-                    "vs_currency": "usd",
-                    "include_notes": True,
-                    "market_offset": 0,
-                    "market_batch_size": 20,
-                    "return_pre_filter_candidates": True,
-                    "compact_response": False,
-                },
-                {
-                    "pattern_name": "crown_shelf_right_spike",
-                    "min_age_days": 14,
-                    "max_age_days": 394,
-                    "top_k": 30,
-                    "max_coins_to_evaluate": 300,
-                    "vs_currency": "usd",
-                    "include_notes": True,
-                    "coingecko_ids": ["bitcoin", "ethereum"],
-                    "compact_response": True,
-                },
-            ]
+class CoinGeckoClient:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+
+    def _api_base(self) -> str:
+        base = (self.settings.coingecko_api_base or "").strip() or PUBLIC_API_BASE
+        plan = (self.settings.coingecko_api_plan or "").strip().lower()
+        if not base:
+            return PRO_API_BASE if plan == "pro" else PUBLIC_API_BASE
+        return base.rstrip("/")
+
+    def _headers(self, pro: bool = False) -> dict[str, str]:
+        headers = {
+            "User-Agent": self.settings.user_agent,
+            "accept": "application/json",
         }
-    )
+        api_key = (self.settings.coingecko_api_key or "").strip()
+        if api_key:
+            # Demo/public plans use x-cg-demo-api-key; Pro uses x-cg-pro-api-key.
+            if pro:
+                headers["x-cg-pro-api-key"] = api_key
+            else:
+                headers["x-cg-demo-api-key"] = api_key
+        return headers
 
-    pattern_name: PatternName = "crown_shelf_right_spike"
-    min_age_days: int = Field(default=14, ge=1, le=5000)
-    max_age_days: int = Field(default=394, ge=1, le=5000)
-    top_k: int = Field(default=30, ge=1, le=100)
-    max_coins_to_evaluate: int = Field(default=300, ge=1, le=500)
-    vs_currency: str = Field(default="usd")
-    include_notes: bool = True
-    debug: bool = False
-    symbols: Optional[list[str]] = Field(default=None)
-    coingecko_ids: Optional[list[str]] = Field(default=None)
-    exclude_symbols: Optional[list[str]] = Field(default=None)
-    market_offset: int = Field(default=0, ge=0)
-    market_batch_size: Optional[int] = Field(default=None, ge=1, le=500)
-    return_pre_filter_candidates: bool = True
-    compact_response: bool = False
-    stage_mode: StageMode = "legacy"
+    def _auth_params(self, pro: bool = False) -> dict[str, str]:
+        api_key = (self.settings.coingecko_api_key or "").strip()
+        if not api_key:
+            return {}
+        # CoinGecko documents both header and query auth styles.
+        return {"x_cg_pro_api_key" if pro else "x_cg_demo_api_key": api_key}
 
+    async def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        require_history_auth: bool = False,
+    ) -> Any:
+        timeout = httpx.Timeout(self.settings.request_timeout_seconds)
+        params = dict(params or {})
+        configured_base = self._api_base()
+        plan = (self.settings.coingecko_api_plan or "").strip().lower()
+        api_key_present = bool((self.settings.coingecko_api_key or "").strip())
 
-class MatchBreakdown(BaseModel):
-    crown: float
-    drop: float
-    shelf: float
-    right_spike: float
-    reversion: float
-    asymmetry: float
-    template_shape: float
+        # Try the most likely auth/base combination first, then fall back.
+        candidates: list[tuple[str, bool]] = []
+        if "pro-api.coingecko.com" in configured_base or plan == "pro":
+            candidates.append((configured_base, True))
+            if configured_base != PUBLIC_API_BASE:
+                candidates.append((PUBLIC_API_BASE, False))
+        else:
+            candidates.append((configured_base, False))
+            if configured_base != PRO_API_BASE and api_key_present and plan == "pro":
+                candidates.append((PRO_API_BASE, True))
 
+        last_exc: Exception | None = None
+        for base_url, pro in candidates:
+            trial_params = dict(params)
+            trial_params.update(self._auth_params(pro=pro))
+            async with httpx.AsyncClient(timeout=timeout, headers=self._headers(pro=pro)) as client:
+                try:
+                    response = await client.get(f"{base_url}{path}", params=trial_params)
+                    if response.status_code == 401 and not api_key_present and require_history_auth:
+                        response.raise_for_status()
+                    response.raise_for_status()
+                    return response.json()
+                except httpx.HTTPStatusError as exc:
+                    last_exc = exc
+                    # If the first attempt failed with auth-related issues, try the next candidate.
+                    if exc.response.status_code in {401, 403}:
+                        continue
+                    raise
+                except Exception as exc:
+                    last_exc = exc
+                    raise
 
-class BestWindow(BaseModel):
-    start_idx: int
-    end_idx: int
-    length_days: int
-    best_age_days: int
-    candidate_windows_count: int
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("CoinGecko request failed without an exception")
 
+    async def fetch_markets(
+        self,
+        vs_currency: str = "usd",
+        page: int = 1,
+        per_page: int = 50,
+    ) -> list[dict[str, Any]]:
+        return await self._get(
+            "/coins/markets",
+            {
+                "vs_currency": vs_currency,
+                "order": "market_cap_desc",
+                "per_page": per_page,
+                "page": page,
+                "sparkline": "false",
+                "price_change_percentage": "24h",
+            },
+        )
 
-class DebugSymbolInfo(BaseModel):
-    input_symbol: str | None = None
-    input_coingecko_id: str | None = None
-    source_type: str | None = None
-    resolved: bool = False
-    coingecko_id: str | None = None
-    status: str = "unknown"
-    stage: str = "unknown"
-    reason: str | None = None
-    endpoint: str | None = None
-    http_status: int | None = None
-    request_params: Dict[str, Any] | None = None
-    error_message: str | None = None
-    auth_mode: str | None = None
-    base_url: str | None = None
-    api_key_present: bool | None = None
-    auth_header_name: str | None = None
-    universe_filter_status: str | None = None
-    universe_filter_reason: str | None = None
-    candidate_windows_count: int | None = None
-    best_window: Dict[str, Any] | None = None
-    structural_score: float | None = None
-    raw_similarity: float | None = None
-    label: str | None = None
+    async def search_symbol(self, query: str) -> list[dict[str, Any]]:
+        data = await self._get("/search", {"query": query})
+        return data.get("coins", [])
 
+    async def fetch_market_chart(self, coin_id: str, vs_currency: str = "usd", days: int = 365) -> dict[str, Any]:
+        api_key_present = bool((self.settings.coingecko_api_key or "").strip())
+        plan = (self.settings.coingecko_api_plan or "").strip().lower()
+        effective_days = int(days)
+        # CoinGecko Demo/Public historical access is limited to the past 365 days.
+        if plan != "pro" or not api_key_present:
+            effective_days = min(effective_days, 365)
+        return await self._get(
+            f"/coins/{coin_id}/market_chart",
+            {"vs_currency": vs_currency, "days": effective_days, "interval": "daily"},
+            require_history_auth=True,
+        )
 
-class ScanResult(BaseModel):
-    coingecko_id: str
-    symbol: str
-    name: str
-    age_days: int
-    market_cap_usd: float | None = None
-    volume_24h_usd: float | None = None
-    similarity: float
-    raw_similarity: float
-    label: str
-    label_before_final_gate: str | None = None
-    stage: str
-    structural_score: float
-    exemplar_consistency_score: float = 0.0
-    distance_to_siren_breakdown: float = 0.0
-    distance_to_river_breakdown: float = 0.0
-    reference_band_passed: bool = True
-    pre_breakout_base_score: float | None = None
-    early_impulse_score: float | None = None
-    return_to_base_score: float | None = None
-    base_duration_score: float | None = None
-    base_compaction_score: float | None = None
-    right_side_tightening_score: float | None = None
-    breakout_not_started_score: float | None = None
-    late_breakout_penalty: float | None = None
-    post_breakout_extension_penalty: float | None = None
-    selected_window_stage: str | None = None
-    universe_filter_status: str = "passed"
-    universe_filter_reason: str = ""
-    breakdown: MatchBreakdown
-    best_window: BestWindow
-    notes: list[str] = Field(default_factory=list)
-    source: str = "coingecko"
+    async def fetch_coin(self, coin_id: str) -> dict[str, Any]:
+        return await self._get(
+            f"/coins/{coin_id}",
+            {
+                "localization": "false",
+                "tickers": "false",
+                "community_data": "false",
+                "developer_data": "false",
+            },
+        )
 
-
-class CompactScanResult(BaseModel):
-    coingecko_id: str
-    symbol: str
-    name: str
-    similarity: float
-    age_days: int
-    label: str
-
-
-class ScanResponse(BaseModel):
-    pattern_name: PatternName
-    universe_provider: str = "coingecko"
-    history_provider: str = "coingecko"
-    evaluated_count: int
-    returned_count: int
-    market_offset: int = 0
-    market_batch_size: int = 0
-    pages_scanned: int = 0
-    total_candidates_seen: int = 0
-    results: list[ScanResult]
-    pre_filter_candidates: list[ScanResult] = Field(default_factory=list)
-    debug_by_symbol: Dict[str, DebugSymbolInfo] = Field(default_factory=dict)
-
-
-class CompactScanResponse(BaseModel):
-    pattern_name: PatternName
-    universe_provider: str = "coingecko"
-    history_provider: str = "coingecko"
-    evaluated_count: int
-    returned_count: int
-    market_offset: int = 0
-    market_batch_size: int = 0
-    pages_scanned: int = 0
-    total_candidates_seen: int = 0
-    results: list[CompactScanResult]
-
-
-class ErrorResponse(BaseModel):
-    detail: str
+    @staticmethod
+    def age_days_from_iso(date_str: str | None) -> int | None:
+        if not date_str:
+            return None
+        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).days

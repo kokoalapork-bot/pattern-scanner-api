@@ -1,147 +1,77 @@
-from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta, timezone
 
-import httpx
+import pytest
 
-from .config import get_settings
-
-
-PUBLIC_API_BASE = "https://api.coingecko.com/api/v3"
-PRO_API_BASE = "https://pro-api.coingecko.com/api/v3"
+from app.models import ScanRequest
+from app.services import scan_pattern
 
 
-class CoinGeckoClient:
-    def __init__(self) -> None:
-        self.settings = get_settings()
+def _dated_series(start: datetime, values: list[float]):
+    return [[int((start + timedelta(days=i)).timestamp() * 1000), p] for i, p in enumerate(values)]
 
-    def _api_base(self) -> str:
-        base = (self.settings.coingecko_api_base or "").strip() or PUBLIC_API_BASE
-        plan = (self.settings.coingecko_api_plan or "").strip().lower()
-        if not base:
-            return PRO_API_BASE if plan == "pro" else PUBLIC_API_BASE
-        return base.rstrip("/")
 
-    def _headers(self, pro: bool = False) -> dict[str, str]:
-        headers = {
-            "User-Agent": self.settings.user_agent,
-            "accept": "application/json",
+class DummyClient:
+    async def fetch_markets(self, vs_currency: str = "usd", page: int = 1, per_page: int = 50):
+        return [
+            {
+                "id": "old-coin",
+                "symbol": "OLD",
+                "name": "Old Coin",
+                "market_cap": 5_000_000,
+                "total_volume": 500_000,
+            },
+            {
+                "id": "new-coin",
+                "symbol": "NEW",
+                "name": "New Coin",
+                "market_cap": 5_000_000,
+                "total_volume": 500_000,
+            },
+        ]
+
+    async def fetch_coin(self, coin_id: str):
+        if coin_id == "old-coin":
+            return {
+                "id": coin_id,
+                "symbol": "old",
+                "name": "Old Coin",
+                "genesis_date": "2022-06-01",
+                "market_data": {
+                    "market_cap": {"usd": 5_000_000},
+                    "total_volume": {"usd": 500_000},
+                    "ath_date": {"usd": "2022-06-02T00:00:00.000Z"},
+                    "atl_date": {"usd": "2022-06-03T00:00:00.000Z"},
+                    "market_cap_rank": 9999,
+                },
+            }
+        return {
+            "id": coin_id,
+            "symbol": "new",
+            "name": "New Coin",
+            "genesis_date": "2025-04-01",
+            "market_data": {
+                "market_cap": {"usd": 5_000_000},
+                "total_volume": {"usd": 500_000},
+                "ath_date": {"usd": "2025-04-20T00:00:00.000Z"},
+                "atl_date": {"usd": "2025-04-10T00:00:00.000Z"},
+                "market_cap_rank": 9999,
+            },
         }
-        api_key = (self.settings.coingecko_api_key or "").strip()
-        if api_key:
-            # Demo/public plans use x-cg-demo-api-key; Pro uses x-cg-pro-api-key.
-            if pro:
-                headers["x-cg-pro-api-key"] = api_key
-            else:
-                headers["x-cg-demo-api-key"] = api_key
-        return headers
 
-    def _auth_params(self, pro: bool = False) -> dict[str, str]:
-        api_key = (self.settings.coingecko_api_key or "").strip()
-        if not api_key:
-            return {}
-        # CoinGecko documents both header and query auth styles.
-        return {"x_cg_pro_api_key" if pro else "x_cg_demo_api_key": api_key}
+    async def fetch_market_chart(self, coin_id: str, vs_currency: str = "usd", days: int = 365):
+        start = datetime(2025, 4, 1, tzinfo=timezone.utc)
+        prices = [10 + i * 0.05 for i in range(80)]
+        prices[20:30] = [14.0, 14.1, 14.3, 14.5, 14.4, 14.35, 14.3, 14.25, 14.2, 14.15]
+        prices[30:45] = [13.9, 13.5, 13.1, 12.7, 12.3, 12.0, 11.8, 11.6, 11.45, 11.3, 11.2, 11.1, 11.0, 10.95, 10.9]
+        prices[45:65] = [10.95, 10.9, 10.92, 10.91, 10.93, 10.95, 10.94, 10.96, 10.98, 11.0, 11.02, 11.01, 11.0, 10.99, 11.0, 11.02, 11.03, 11.04, 11.05, 11.06]
+        prices[65:70] = [11.2, 11.4, 11.8, 11.3, 11.0]
+        return {"prices": _dated_series(start, prices)}
 
-    async def _get(
-        self,
-        path: str,
-        params: dict[str, Any] | None = None,
-        *,
-        require_history_auth: bool = False,
-    ) -> Any:
-        timeout = httpx.Timeout(self.settings.request_timeout_seconds)
-        params = dict(params or {})
-        configured_base = self._api_base()
-        plan = (self.settings.coingecko_api_plan or "").strip().lower()
-        api_key_present = bool((self.settings.coingecko_api_key or "").strip())
 
-        # Try the most likely auth/base combination first, then fall back.
-        candidates: list[tuple[str, bool]] = []
-        if "pro-api.coingecko.com" in configured_base or plan == "pro":
-            candidates.append((configured_base, True))
-            if configured_base != PUBLIC_API_BASE:
-                candidates.append((PUBLIC_API_BASE, False))
-        else:
-            candidates.append((configured_base, False))
-            if configured_base != PRO_API_BASE and api_key_present and plan == "pro":
-                candidates.append((PRO_API_BASE, True))
-
-        last_exc: Exception | None = None
-        for base_url, pro in candidates:
-            trial_params = dict(params)
-            trial_params.update(self._auth_params(pro=pro))
-            async with httpx.AsyncClient(timeout=timeout, headers=self._headers(pro=pro)) as client:
-                try:
-                    response = await client.get(f"{base_url}{path}", params=trial_params)
-                    if response.status_code == 401 and not api_key_present and require_history_auth:
-                        response.raise_for_status()
-                    response.raise_for_status()
-                    return response.json()
-                except httpx.HTTPStatusError as exc:
-                    last_exc = exc
-                    # If the first attempt failed with auth-related issues, try the next candidate.
-                    if exc.response.status_code in {401, 403}:
-                        continue
-                    raise
-                except Exception as exc:
-                    last_exc = exc
-                    raise
-
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError("CoinGecko request failed without an exception")
-
-    async def fetch_markets(
-        self,
-        vs_currency: str = "usd",
-        page: int = 1,
-        per_page: int = 50,
-    ) -> list[dict[str, Any]]:
-        return await self._get(
-            "/coins/markets",
-            {
-                "vs_currency": vs_currency,
-                "order": "market_cap_desc",
-                "per_page": per_page,
-                "page": page,
-                "sparkline": "false",
-                "price_change_percentage": "24h",
-            },
-        )
-
-    async def search_symbol(self, query: str) -> list[dict[str, Any]]:
-        data = await self._get("/search", {"query": query})
-        return data.get("coins", [])
-
-    async def fetch_market_chart(self, coin_id: str, vs_currency: str = "usd", days: int = 365) -> dict[str, Any]:
-        api_key_present = bool((self.settings.coingecko_api_key or "").strip())
-        plan = (self.settings.coingecko_api_plan or "").strip().lower()
-        effective_days = int(days)
-        # CoinGecko Demo/Public historical access is limited to the past 365 days.
-        if plan != "pro" or not api_key_present:
-            effective_days = min(effective_days, 365)
-        return await self._get(
-            f"/coins/{coin_id}/market_chart",
-            {"vs_currency": vs_currency, "days": effective_days, "interval": "daily"},
-            require_history_auth=True,
-        )
-
-    async def fetch_coin(self, coin_id: str) -> dict[str, Any]:
-        return await self._get(
-            f"/coins/{coin_id}",
-            {
-                "localization": "false",
-                "tickers": "false",
-                "community_data": "false",
-                "developer_data": "false",
-            },
-        )
-
-    @staticmethod
-    def age_days_from_iso(date_str: str | None) -> int | None:
-        if not date_str:
-            return None
-        dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-        return (datetime.now(timezone.utc) - dt).days
+@pytest.mark.asyncio
+async def test_old_coins_are_rejected_by_metadata_prefilter():
+    req = ScanRequest(top_k=10, max_coins_to_evaluate=10, market_batch_size=50)
+    resp = await scan_pattern(req, client=DummyClient())
+    ids = {r.coingecko_id for r in resp.results}
+    assert "old-coin" not in ids

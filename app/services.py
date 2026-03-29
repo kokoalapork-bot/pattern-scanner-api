@@ -32,6 +32,43 @@ SYMBOL_ID_OVERRIDES = {
 }
 
 
+_ALLOWED_FIRST_HISTORY_MS = _ms(MIN_ALLOWED_FIRST_HISTORY_DATE)
+
+
+def _earliest_known_market_date_ms(coin: dict[str, Any]) -> int | None:
+    candidates: list[int] = []
+
+    for key in ("genesis_date", "ath_date", "atl_date", "first_history_date"):
+        parsed = _parse_iso_date(coin.get(key))
+        if parsed is not None:
+            candidates.append(int(parsed.timestamp() * 1000))
+
+    for key in ("first_history_timestamp",):
+        raw = coin.get(key)
+        if raw is None:
+            continue
+        try:
+            candidates.append(int(raw))
+        except Exception:
+            pass
+
+    return min(candidates) if candidates else None
+
+
+def _coin_is_old_by_metadata(coin: dict[str, Any]) -> bool:
+    earliest = _earliest_known_market_date_ms(coin)
+    return earliest is not None and earliest < _ALLOWED_FIRST_HISTORY_MS
+
+
+def _extract_detail_market_dates(coin_detail: dict[str, Any], vs_currency: str) -> dict[str, Any]:
+    market = coin_detail.get("market_data", {}) if isinstance(coin_detail, dict) else {}
+    return {
+        "genesis_date": coin_detail.get("genesis_date"),
+        "ath_date": (market.get("ath_date", {}) or {}).get(vs_currency),
+        "atl_date": (market.get("atl_date", {}) or {}).get(vs_currency),
+    }
+
+
 def _is_stable(coin: dict[str, Any]) -> bool:
     text = f"{coin.get('id','')} {coin.get('symbol','')} {coin.get('name','')}".lower()
     return any(word in text.split() or word in text for word in STABLE_KEYWORDS)
@@ -226,6 +263,33 @@ async def scan_pattern(req: ScanRequest, client: CoinGeckoClient | None = None):
                 dbg.reason = "excluded symbol"
             continue
 
+        coin_id = coin["id"]
+
+        # Hard global pre-filter: reject assets whose known market history predates 2025-01-01.
+        # For market-universe rows CoinGecko often omits genesis_date, so we hydrate the coin once
+        # and inspect genesis/ATH/ATL metadata before we ever score it.
+        if coin_id not in REFERENCE_WINDOWS:
+            needs_detail = (
+                coin.get("genesis_date") is None
+                and coin.get("ath_date") is None
+                and coin.get("atl_date") is None
+            )
+            if needs_detail:
+                try:
+                    detail_coin = await client.fetch_coin(coin_id)
+                    coin.update(_extract_detail_market_dates(detail_coin, req.vs_currency))
+                except httpx.HTTPError as exc:
+                    if dbg:
+                        dbg.status = "fetch_coin_failed"
+                        dbg.reason = f"metadata hydration failed: {exc}"
+                    continue
+
+            if _coin_is_old_by_metadata(coin):
+                if dbg:
+                    dbg.status = "skipped"
+                    dbg.reason = f"older than {MIN_ALLOWED_FIRST_HISTORY_DATE} by metadata"
+                continue
+
         market_cap = coin.get("market_cap") or coin.get("market_cap_usd")
         volume = coin.get("total_volume") or coin.get("volume_24h_usd") or 0.0
         if not explicit_selection:
@@ -234,7 +298,6 @@ async def scan_pattern(req: ScanRequest, client: CoinGeckoClient | None = None):
             if volume is not None and volume < settings.min_24h_volume_usd:
                 continue
 
-        coin_id = coin["id"]
         try:
             history = await client.fetch_market_chart(coin_id, vs_currency=req.vs_currency, days=min(req.max_age_days, settings.default_max_age_days))
         except httpx.HTTPError as exc:
@@ -272,11 +335,16 @@ async def scan_pattern(req: ScanRequest, client: CoinGeckoClient | None = None):
                 dbg.status = "skipped"
                 dbg.reason = "first history timestamp unavailable"
             continue
-        if first_ts < _ms(MIN_ALLOWED_FIRST_HISTORY_DATE) and coin_id not in REFERENCE_WINDOWS:
-            if dbg:
-                dbg.status = "skipped"
-                dbg.reason = f"first history date older than {MIN_ALLOWED_FIRST_HISTORY_DATE}"
-            continue
+
+        coin["first_history_timestamp"] = int(first_ts)
+        coin["first_history_date"] = datetime.fromtimestamp(int(first_ts) / 1000, tz=timezone.utc).date().isoformat()
+
+        if coin_id not in REFERENCE_WINDOWS:
+            if _coin_is_old_by_metadata(coin):
+                if dbg:
+                    dbg.status = "skipped"
+                    dbg.reason = f"older than {MIN_ALLOWED_FIRST_HISTORY_DATE} by history/metadata"
+                continue
 
         score = score_crown_shelf_right_spike(prices, timestamps=timestamps, coin_id=coin_id)
         if score.similarity <= 0:

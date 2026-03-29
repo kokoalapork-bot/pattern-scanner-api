@@ -1,46 +1,45 @@
+import httpx
+import pytest
 
-from datetime import datetime, timedelta, timezone
-
-from app.patterns import score_crown_shelf_right_spike
-
-
-def _series(start_date: datetime, values: list[float]):
-    ts = [int((start_date + timedelta(days=i)).timestamp() * 1000) for i in range(len(values))]
-    return values, ts
+from app.data_sources import CoinGeckoClient
 
 
-def test_reference_river_passes():
-    start = datetime(2025, 9, 22, tzinfo=timezone.utc)
-    prices = [10 + (i * 0.03) for i in range(100)]
-    prices[25:34] = [14.0, 14.2, 14.5, 14.6, 14.55, 14.52, 14.48, 14.45, 14.4]
-    prices[34:46] = [14.3, 14.2, 14.0, 13.8, 13.5, 13.2, 12.8, 12.2, 11.7, 11.2, 10.8, 10.5]
-    prices[46:70] = [10.4, 10.35, 10.3, 10.32, 10.28, 10.3, 10.31, 10.35, 10.33, 10.31, 10.3, 10.32, 10.31, 10.33, 10.34, 10.36, 10.39, 10.41, 10.43, 10.45, 10.47, 10.5, 10.52, 10.55]
-    prices[70:75] = [10.7, 11.0, 11.5, 10.8, 10.55]
-    prices, timestamps = _series(start, prices)
-    result = score_crown_shelf_right_spike(prices, timestamps=timestamps, coin_id="river")
-    assert result.similarity >= 86
-    assert result.stage in {"active", "completed"}
+@pytest.mark.asyncio
+async def test_fetch_market_chart_demo_caps_days_and_uses_demo_auth(monkeypatch):
+    class DummyResponse:
+        status_code = 200
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"prices": []}
 
+    calls = []
 
-def test_reference_siren_passes():
-    start = datetime(2025, 3, 20, tzinfo=timezone.utc)
-    n = 323
-    prices = [5 + i * 0.01 for i in range(n)]
-    crown = [11.0, 11.4, 11.8, 12.0, 12.1, 12.05, 12.0, 11.95, 11.9, 11.85, 11.8, 11.75]
-    prices[55:67] = crown
-    prices[67:88] = [11.7, 11.6, 11.55, 11.5, 11.45, 11.4, 11.2, 11.0, 10.8, 10.5, 10.2, 9.9, 9.6, 9.4, 9.2, 9.0, 8.9, 8.8, 8.75, 8.7, 8.65]
-    prices[88:160] = [8.7 + ((i % 5) * 0.03) for i in range(72)]
-    prices[160:168] = [8.8, 9.0, 9.3, 9.7, 10.0, 9.4, 9.0, 8.85]
-    prices, timestamps = _series(start, prices)
-    result = score_crown_shelf_right_spike(prices, timestamps=timestamps, coin_id="siren-2")
-    assert result.similarity >= 86
-    assert result.stage in {"active", "completed"}
+    class DummyAsyncClient:
+        def __init__(self, *args, headers=None, **kwargs):
+            self.headers = headers or {}
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+        async def get(self, url, params=None):
+            calls.append((url, dict(params or {}), dict(self.headers)))
+            return DummyResponse()
 
+    monkeypatch.setenv("COINGECKO_API_KEY", "demo-key")
+    monkeypatch.setenv("COINGECKO_API_PLAN", "demo")
+    from app.config import get_settings
+    get_settings.cache_clear()
 
-def test_listing_ath_is_filtered():
-    start = datetime(2025, 1, 2, tzinfo=timezone.utc)
-    prices = [20.0] + [10 + (i * 0.02) for i in range(80)]
-    prices, timestamps = _series(start, prices)
-    result = score_crown_shelf_right_spike(prices, timestamps=timestamps)
-    assert result.similarity == 0
-    assert result.stage == "filtered"
+    monkeypatch.setattr(httpx, "AsyncClient", DummyAsyncClient)
+    client = CoinGeckoClient()
+    await client.fetch_market_chart("river", days=450)
+
+    assert calls
+    url, params, headers = calls[0]
+    assert "api.coingecko.com/api/v3/coins/river/market_chart" in url
+    assert params["days"] == 365
+    assert params["x_cg_demo_api_key"] == "demo-key"
+    assert headers["x-cg-demo-api-key"] == "demo-key"
+
+    get_settings.cache_clear()

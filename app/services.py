@@ -112,6 +112,9 @@ async def _collect_universe(
                 dbg = debug_by_symbol.setdefault(coin_id.upper(), DebugSymbolInfo(input_coingecko_id=coin_id))
                 dbg.status = "fetch_coin_failed"
                 dbg.reason = str(exc)
+                dbg.api_key_present = bool((settings.coingecko_api_key or "").strip())
+                dbg.auth_mode = (settings.coingecko_api_plan or "demo").lower()
+                dbg.base_url = client._api_base()
         return items, 1, len(items)
 
     ids_from_symbols: list[str] = []
@@ -123,6 +126,9 @@ async def _collect_universe(
             except httpx.HTTPError as exc:
                 dbg.status = "resolve_failed"
                 dbg.reason = str(exc)
+                dbg.api_key_present = bool((settings.coingecko_api_key or "").strip())
+                dbg.auth_mode = (settings.coingecko_api_plan or "demo").lower()
+                dbg.base_url = client._api_base()
                 continue
             if resolved:
                 ids_from_symbols.append(resolved)
@@ -214,11 +220,14 @@ async def scan_pattern(req: ScanRequest, client: CoinGeckoClient | None = None):
 
         coin_id = coin["id"]
         try:
-            history = await client.fetch_market_chart(coin_id, vs_currency=req.vs_currency, days=min(req.max_age_days, 450))
+            history = await client.fetch_market_chart(coin_id, vs_currency=req.vs_currency, days=min(req.max_age_days, settings.default_max_age_days))
         except httpx.HTTPError as exc:
             if dbg:
                 dbg.status = "history_failed"
                 dbg.reason = str(exc)
+                dbg.api_key_present = bool((settings.coingecko_api_key or "").strip())
+                dbg.auth_mode = (settings.coingecko_api_plan or "demo").lower()
+                dbg.base_url = client._api_base()
             continue
 
         prices = [p[1] for p in history.get("prices", []) if isinstance(p, list) and len(p) >= 2]

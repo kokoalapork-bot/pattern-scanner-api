@@ -28,7 +28,7 @@ class RootResponse(BaseModel):
 
 app = FastAPI(
     title="Crypto Pattern Scanner API",
-    version="1.2.3",
+    version="1.2.4",
     description=(
         "Scans crypto assets for the crown-shelf-right-spike base structure. "
         "Uses CoinGecko for market universe discovery and historical chart scoring."
@@ -56,7 +56,7 @@ async def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         service="crypto-pattern-scanner",
-        version="1.2.3",
+        version="1.2.4",
     )
 
 

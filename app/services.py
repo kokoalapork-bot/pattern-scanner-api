@@ -36,18 +36,43 @@ def _is_tokenized_stock(coin: dict[str, Any]) -> bool:
     return any(word in text for word in TOKENIZED_STOCK_KEYWORDS)
 
 
+def _parse_iso_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if len(value) == 10:
+            return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _score_symbol_candidate(item: dict[str, Any], target_symbol: str) -> tuple[int, int, int]:
+    symbol_match = 1 if str(item.get("symbol", "")).upper() == target_symbol.upper() else 0
+    # lower market_cap_rank is better; treat missing as very weak
+    rank = item.get("market_cap_rank")
+    rank_score = 1_000_000 if rank in (None, 0) else int(rank)
+    # prefer ids that are not clearly stale duplicates like "siren" over "siren-2" only when rank is better
+    return (
+        symbol_match,
+        -rank_score,
+        -len(str(item.get("id", ""))),
+    )
+
+
 async def _resolve_symbol(client: CoinGeckoClient, symbol: str) -> str | None:
     matches = await client.search_symbol(symbol)
-    symbol_upper = symbol.upper()
-    for item in matches:
-        if item.get("symbol", "").upper() == symbol_upper:
-            return item.get("id")
-    return matches[0].get("id") if matches else None
+    if not matches:
+        return None
+
+    exact = [item for item in matches if str(item.get("symbol", "")).upper() == symbol.upper()]
+    candidates = exact or matches
+
+    best = sorted(candidates, key=lambda item: _score_symbol_candidate(item, symbol), reverse=True)[0]
+    return best.get("id")
 
 
 async def _collect_universe(req: ScanRequest, client: CoinGeckoClient) -> tuple[list[dict[str, Any]], int, int]:
-    settings = get_settings()
-
     if req.coingecko_ids:
         items = []
         for coin_id in req.coingecko_ids:
@@ -64,6 +89,7 @@ async def _collect_universe(req: ScanRequest, client: CoinGeckoClient) -> tuple[
                         "atl_date": None,
                         "ath_date": market.get("ath_date", {}).get(req.vs_currency),
                         "genesis_date": coin.get("genesis_date"),
+                        "market_cap_rank": market.get("market_cap_rank"),
                     }
                 )
             except httpx.HTTPError:
@@ -85,21 +111,30 @@ async def _collect_universe(req: ScanRequest, client: CoinGeckoClient) -> tuple[
     markets = await client.fetch_markets(vs_currency=req.vs_currency, page=page, per_page=per_page)
     return markets, 1, len(markets)
 
-def _age_days(coin: dict[str, Any]) -> int | None:
+
+def _age_days_from_history(history: dict[str, Any]) -> int | None:
+    prices = history.get("prices", [])
+    if not prices:
+        return None
+    first = prices[0]
+    if not (isinstance(first, list) and len(first) >= 2):
+        return None
+    try:
+        ts_ms = int(first[0])
+        first_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        return max(0, (datetime.now(timezone.utc) - first_dt).days)
+    except Exception:
+        return None
+
+
+def _age_days_fallback(coin: dict[str, Any]) -> int | None:
     now = datetime.now(timezone.utc)
     for key in ("genesis_date", "ath_date", "atl_date"):
-        value = coin.get(key)
-        if not value:
-            continue
-        try:
-            if len(value) == 10:
-                dt = datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
-            else:
-                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = _parse_iso_date(coin.get(key))
+        if dt is not None:
             return max(0, (now - dt).days)
-        except Exception:
-            continue
     return None
+
 
 async def scan_pattern(req: ScanRequest):
     settings = get_settings()
@@ -110,18 +145,14 @@ async def scan_pattern(req: ScanRequest):
 
     universe, pages_scanned, total_candidates_seen = await _collect_universe(req, client)
     evaluated: list[ScanResult] = []
+    exclude_symbols_upper = {s.upper() for s in (req.exclude_symbols or [])}
 
     for coin in universe:
-        age_days = _age_days(coin)
-        if age_days is None:
-            continue
-        if not (req.min_age_days <= age_days <= req.max_age_days):
-            continue
         if settings.exclude_stables and _is_stable(coin):
             continue
         if settings.exclude_tokenized_stocks and _is_tokenized_stock(coin):
             continue
-        if req.exclude_symbols and coin.get("symbol", "").upper() in {s.upper() for s in req.exclude_symbols}:
+        if coin.get("symbol", "").upper() in exclude_symbols_upper:
             continue
 
         market_cap = coin.get("market_cap") or coin.get("market_cap_usd")
@@ -139,6 +170,12 @@ async def scan_pattern(req: ScanRequest):
 
         prices = [p[1] for p in history.get("prices", []) if isinstance(p, list) and len(p) >= 2]
         if len(prices) < 30:
+            continue
+
+        age_days = _age_days_from_history(history) or _age_days_fallback(coin)
+        if age_days is None:
+            continue
+        if not (req.min_age_days <= age_days <= req.max_age_days):
             continue
 
         score = score_crown_shelf_right_spike(prices)

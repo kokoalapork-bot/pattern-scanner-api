@@ -54,7 +54,7 @@ curl -X POST "http://localhost:8000/scan" \
 Это восстановленная рабочая версия с тем же API-назначением и совместимой структурой файлов.
 
 
-## Версия 1.2.2
+## Версия 1.2.1
 - reference-aware scoring для эталонов RIVER и SIREN
 - bypass liquidity filters для явных `symbols` и `coingecko_ids`
 - в score передаются timestamps и coin_id
@@ -71,3 +71,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 If you deploy from GitHub on Render, the repository root must contain `requirements.txt`.
+
+
+## CoinGecko free/demo key setup
+
+For free/demo access, set:
+
+- `COINGECKO_API_KEY=<your key>`
+- `COINGECKO_API_PLAN=demo`
+
+The app sends the key in both the `x-cg-demo-api-key` header and the `x_cg_demo_api_key` query parameter for better compatibility. Historical requests are capped at 365 days on demo/public plans because CoinGecko limits public/demo historical access to the past 365 days. citeturn710180search1turn710180search9

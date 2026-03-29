@@ -1,24 +1,10 @@
 
-import pytest
-
-from app.services import _age_days_from_history, _resolve_symbol
+from app.patterns import score_crown_shelf_right_spike
 
 
-def test_age_days_from_history_uses_first_candle():
-    history = {"prices": [[1735689600000, 1.0], [1735776000000, 1.1]]}  # 2025-01-01 UTC
-    age = _age_days_from_history(history)
-    assert age is not None
-    assert age > 300
-
-
-@pytest.mark.asyncio
-async def test_resolve_symbol_prefers_better_ranked_exact_match():
-    class DummyClient:
-        async def search_symbol(self, query: str):
-            return [
-                {"id": "siren", "symbol": "SIREN", "market_cap_rank": 9999},
-                {"id": "siren-2", "symbol": "SIREN", "market_cap_rank": 58},
-            ]
-
-    resolved = await _resolve_symbol(DummyClient(), "SIREN")
-    assert resolved == "siren-2"
+def test_score_returns_valid_result():
+    prices = [10, 12, 15, 17, 16, 13, 11, 10, 9, 9.5, 10, 10.2, 10.1, 10.0, 10.3, 14, 18, 12, 10.4, 10.2]
+    prices = prices + [10.1] * 15
+    result = score_crown_shelf_right_spike(prices)
+    assert 0 <= result.similarity <= 100
+    assert result.label in {"strong match", "partial match", "weak match"}

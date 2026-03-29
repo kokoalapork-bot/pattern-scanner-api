@@ -251,6 +251,13 @@ async def scan_pattern(req: ScanRequest, client: CoinGeckoClient | None = None):
 
         timestamps = [int(p[0]) for p in history.get("prices", []) if isinstance(p, list) and len(p) >= 2]
         score = score_crown_shelf_right_spike(prices, timestamps=timestamps, coin_id=coin_id)
+        if score.similarity <= 0:
+            if dbg:
+                dbg.status = "skipped"
+                dbg.reason = "; ".join(score.notes) if score.notes else "failed hard pattern gates"
+                dbg.stage = score.stage
+            continue
+
         result = ScanResult(
             coingecko_id=coin_id,
             symbol=symbol_upper,

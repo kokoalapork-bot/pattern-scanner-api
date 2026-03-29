@@ -9,6 +9,13 @@ from statistics import mean
 from .models import BestWindow, MatchBreakdown
 
 
+# Hard gates requested for River-like scans.
+MIN_DAYS_FROM_LISTING_TO_CROWN_START = 15
+MAX_CROWN_BARS = 60
+MAX_PEAK_POSITION_WITHIN_CROWN = 0.60
+MAX_GLOBAL_PEAK_POSITION = 0.55
+
+
 def _clamp(value: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, value))
 
@@ -48,7 +55,7 @@ def _window_indices_from_dates(timestamps: list[int], start_iso: str, end_iso: s
     return idxs[0], idxs[-1]
 
 
-def _segment_metrics(prices: list[float]) -> dict[str, float | int | None]:
+def _segment_metrics(prices: list[float], absolute_start_idx: int = 0) -> dict[str, float | int | None]:
     n = len(prices)
     if n < 20:
         return {"valid": 0}
@@ -106,6 +113,10 @@ def _segment_metrics(prices: list[float]) -> dict[str, float | int | None]:
 
     reversion = 1.0 - _clamp(abs(prices[-1] - shelf_mean) / max(peak * 0.15, 1e-9))
 
+    global_crown_start = absolute_start_idx + left
+    global_peak_idx = absolute_start_idx + peak_idx
+    peak_within_crown = 0.0 if crown_bars <= 1 else (peak_idx - left) / max(crown_bars - 1, 1)
+
     return {
         "valid": 1,
         "n": n,
@@ -121,7 +132,17 @@ def _segment_metrics(prices: list[float]) -> dict[str, float | int | None]:
         "left_idx": left,
         "right_idx": right,
         "dump_idx": dump_idx,
+        "absolute_start_idx": absolute_start_idx,
+        "global_crown_start_idx": global_crown_start,
+        "global_peak_idx": global_peak_idx,
+        "peak_within_crown": peak_within_crown,
+        "ath_on_listing": global_peak_idx <= 1,
+        "crown_too_early": global_crown_start < MIN_DAYS_FROM_LISTING_TO_CROWN_START,
+        "ath_too_late_in_crown": peak_within_crown > MAX_PEAK_POSITION_WITHIN_CROWN,
+        "crown_too_long": crown_bars > MAX_CROWN_BARS,
+        "peak_too_late_in_window": peak_pos > MAX_GLOBAL_PEAK_POSITION,
     }
+
 
 
 def _score_metrics(metrics: dict[str, float | int | None], target_len: int | None = None) -> tuple[float, MatchBreakdown, str, list[str]]:
@@ -137,8 +158,25 @@ def _score_metrics(metrics: dict[str, float | int | None], target_len: int | Non
     right_spike_score = float(metrics["right_spike_score"])
     reversion = float(metrics["reversion"])
     n = int(metrics["n"])
+    peak_within_crown = float(metrics["peak_within_crown"])
 
-    ath_anchor = 1.0 - _clamp(abs(peak_pos - 0.28) / 0.28)  # ATH should happen in left third
+    hard_reasons: list[str] = []
+    if bool(metrics.get("ath_on_listing")):
+        hard_reasons.append("ATH пришелся на момент листинга.")
+    if bool(metrics.get("crown_too_early")):
+        hard_reasons.append(f"Корона начинается раньше чем через {MIN_DAYS_FROM_LISTING_TO_CROWN_START} дней после листинга.")
+    if bool(metrics.get("ath_too_late_in_crown")):
+        hard_reasons.append("Локальный ATH расположен слишком поздно внутри короны.")
+    if bool(metrics.get("crown_too_long")):
+        hard_reasons.append(f"Корона длиннее {MAX_CROWN_BARS} дневных свечей.")
+    if bool(metrics.get("peak_too_late_in_window")):
+        hard_reasons.append("ATH расположен слишком поздно в окне и больше похож на финальный добой.")
+
+    if hard_reasons:
+        breakdown = MatchBreakdown(crown=0.0, drop=0.0, shelf=0.0, right_spike=0.0, reversion=0.0, asymmetry=0.0, template_shape=0.0)
+        return 0.0, breakdown, "filtered", hard_reasons
+
+    ath_anchor = 1.0 - _clamp(abs(peak_pos - 0.28) / 0.28)
     crown_duration = 1.0 - _clamp(abs(crown_bars - max(6, int(n * 0.16))) / max(10, int(n * 0.22)))
     crown_hold = 1.0 - _clamp(abs(hold_bars - max(12, int(n * 0.28))) / max(16, int(n * 0.36)))
     drop_score = _clamp(dump_depth / 0.28)
@@ -146,14 +184,21 @@ def _score_metrics(metrics: dict[str, float | int | None], target_len: int | Non
     if target_len:
         duration_similarity = 1.0 - _clamp(abs(n - target_len) / max(25, target_len * 0.35))
 
-    crown_score = _clamp(0.35 * ath_anchor + 0.30 * crown_duration + 0.25 * crown_hold + 0.10 * float(metrics["top_fraction"]))
+    within_crown_anchor = 1.0 - _clamp(abs(peak_within_crown - 0.33) / 0.33)
+    crown_score = _clamp(
+        0.28 * ath_anchor
+        + 0.20 * crown_duration
+        + 0.20 * crown_hold
+        + 0.17 * within_crown_anchor
+        + 0.15 * float(metrics["top_fraction"])
+    )
     template_score = _clamp(
-        0.34 * crown_score
-        + 0.16 * crown_hold
+        0.33 * crown_score
+        + 0.17 * crown_hold
         + 0.15 * drop_score
         + 0.13 * shelf_flatness
-        + 0.09 * right_spike_score
-        + 0.08 * reversion
+        + 0.10 * right_spike_score
+        + 0.07 * reversion
         + 0.05 * duration_similarity
     )
     similarity = round(template_score * 100, 2)
@@ -165,13 +210,12 @@ def _score_metrics(metrics: dict[str, float | int | None], target_len: int | Non
         label = "weak match"
 
     stage = "active" if reversion > 0.55 else "completed"
-    notes = []
-    if ath_anchor > 0.7:
-        notes.append("Корона ставит ATH в ранней части окна.")
-    else:
-        notes.append("ATH смещен слишком далеко и хуже похож на эталон.")
-    notes.append(f"Удержание верхней зоны после ATH: ~{hold_bars} свечей.")
-    notes.append(f"Длительность короны в верхней зоне: ~{crown_bars} свечей.")
+    notes = [
+        f"Корона стартует примерно через {int(metrics['global_crown_start_idx'])} дней от начала истории.",
+        f"ATH внутри короны расположен на ~{round(peak_within_crown * 100)}% ее длины.",
+        f"Удержание верхней зоны после ATH: ~{hold_bars} свечей.",
+        f"Длительность короны в верхней зоне: ~{crown_bars} свечей.",
+    ]
     if dump_depth > 0.25:
         notes.append("После удержания есть выраженный слив из короны.")
     if shelf_flatness > 0.55:
@@ -192,8 +236,9 @@ def _score_metrics(metrics: dict[str, float | int | None], target_len: int | Non
 
 
 def _candidate_lengths() -> list[int]:
+
     # RIVER ~100 bars, SIREN ~44 bars. Search nearby ranges too.
-    vals = {36, 40, 44, 48, 52, 60, 72, 84, 92, 100, 108, 116}
+    vals = {36, 40, 44, 48, 52, 60}
     return sorted(vals)
 
 
@@ -221,7 +266,7 @@ def score_crown_shelf_right_spike(
         if idxs:
             s, e = idxs
             segment = prices[s:e + 1]
-            metrics = _segment_metrics(segment)
+            metrics = _segment_metrics(segment, absolute_start_idx=s)
             similarity, breakdown, stage, notes = _score_metrics(metrics, target_len=len(segment))
             similarity = max(similarity, 86.0)
             notes = ["Окно совпадает с эталонным интервалом reference-режима."] + notes
@@ -252,7 +297,7 @@ def score_crown_shelf_right_spike(
         for start in range(0, n - target_len + 1, step):
             end = start + target_len
             segment = prices[start:end]
-            metrics = _segment_metrics(segment)
+            metrics = _segment_metrics(segment, absolute_start_idx=start)
             similarity, breakdown, stage, notes = _score_metrics(metrics, target_len=target_len)
             window_count += 1
             if similarity > best_similarity:

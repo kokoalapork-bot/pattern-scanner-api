@@ -54,7 +54,11 @@ curl -X POST "http://localhost:8000/scan" \
 Это восстановленная рабочая версия с тем же API-назначением и совместимой структурой файлов.
 
 
-## Версия 1.2.0
+## Версия 1.2.1
 - reference-aware scoring для эталонов RIVER и SIREN
 - bypass liquidity filters для явных `symbols` и `coingecko_ids`
 - в score передаются timestamps и coin_id
+
+- debug_by_symbol показывает точную причину, если символ отвалился до оценки
+- жесткие overrides для RIVER -> river и SIREN -> siren-2
+- end-to-end тест scan_pattern с mock CoinGecko client
